@@ -823,6 +823,7 @@ dependencies = [
     { name = "pandas", extra = ["parquet"] },
     { name = "scipy" },
     { name = "source-modelling" },
+    { name = "tqdm" },
 ]
 
 [package.optional-dependencies]
@@ -854,6 +855,7 @@ requires-dist = [
     { name = "scipy", specifier = ">=1.17.0" },
     { name = "scipy-stubs", marker = "extra == 'types'", specifier = ">=1.17.0.1" },
     { name = "source-modelling", specifier = ">=2025.12.1" },
+    { name = "tqdm", specifier = ">=4.67.1" },
     { name = "ty", marker = "extra == 'dev'", specifier = ">=0.0.13" },
 ]
 provides-extras = ["dev", "test", "types"]

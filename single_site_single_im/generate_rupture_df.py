@@ -5,7 +5,9 @@ from typing import TypedDict
 import cyclopts
 import numpy as np
 import pandas as pd
+import tqdm
 from nshmdb.nshmdb import NSHMDB, Rupture
+from webob.exc import HTTPNonAuthoritativeInformation
 
 app = cyclopts.App()
 
@@ -27,7 +29,7 @@ def get_rupture_ids(db: NSHMDB) -> set[int]:
         return {
             fault_id
             for (fault_id,) in conn.execute(
-                "SELECT rupture_id FROM rupture where rate != NULL"
+                "SELECT rupture_id FROM rupture where rate > 0"
             ).fetchall()
         }
 
@@ -45,8 +47,21 @@ def extract_all_ruptures(db: NSHMDB) -> list[Rupture]:
     list[Rupture]
         List of ruptures in the database.
     """
-    all_ruptures = get_rupture_ids(db)
-    return [db.get_rupture(rupture) for rupture in all_ruptures]
+    rupture_ids = get_rupture_ids(db)
+    ruptures = []
+    failed_ids = []
+    pbar = tqdm.tqdm(rupture_ids, desc="Extracting ruptures", unit="ruptures")
+    for rupture in pbar:
+        try:
+            ruptures.append(db.get_rupture(rupture))
+        except ValueError:
+            failed_ids.append(rupture)
+            pbar.set_postfix_str(f"{len(failed_ids)} failures")
+
+    print(
+        f"Could not extract ruptures from the following ids: {','.join(str(id) for id in failed_ids)}"
+    )
+    return ruptures
 
 
 @dataclass
@@ -91,8 +106,9 @@ class RuptureRow(TypedDict):
 
 def compile_rupture_dataframe(db: NSHMDB, site: Site) -> pd.DataFrame:
     rupture_rows = []
-
-    for rupture in extract_all_ruptures(db):
+    ruptures = extract_all_ruptures(db)
+    print(f"Found {len(ruptures)} ruptures to add")
+    for rupture in tqdm.tqdm(ruptures, desc="Measuring distances", unit="ruptures"):
         rrup_metres = measure_site_distance(rupture, site)
         rrup_kilomtres = rrup_metres / 1000.0
         rupture_rows.append(
@@ -104,10 +120,10 @@ def compile_rupture_dataframe(db: NSHMDB, site: Site) -> pd.DataFrame:
             )
         )
 
-    return pd.DataFrame(rupture_rows)
+    return pd.DataFrame(rupture_rows).set_index("rupture_id")
 
 
-@app.command
+@app.default
 def build_input_rupture_dataframe(
     nshmdb_path: Path,
     site_lat: float,
@@ -134,3 +150,7 @@ def build_input_rupture_dataframe(
     site = Site(lat=site_lat, lon=site_lon, vs30=site_vs30)
     df = compile_rupture_dataframe(nshmdb, site)
     df.to_parquet(output_path)
+
+
+if __name__ == "__main__":
+    app()
