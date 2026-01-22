@@ -103,6 +103,7 @@ class RuptureRow(TypedDict):
     mag: float
     vs30: float
     rrup: float
+    rate: float
 
 
 def compile_rupture_dataframe(db: NSHMDB, site: Site) -> pd.DataFrame:
@@ -133,6 +134,7 @@ def compile_rupture_dataframe(db: NSHMDB, site: Site) -> pd.DataFrame:
                 mag=rupture.magnitude,
                 vs30=site.vs30,
                 rrup=rrup_kilomtres,
+                rate=rupture.rate,
             )
         )
 
