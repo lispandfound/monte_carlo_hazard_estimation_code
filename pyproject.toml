@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
   "cyclopts>=4.5.0",
+  "deptry>=0.24.0",
   "nshmdb>=2025.12.1",
   "numba>=0.63",
   "numpy>=2.3.5",
@@ -20,3 +21,28 @@ dependencies = [
 dev = ["numpydoc>=1.10.0", "ruff>=0.14.13", "ty>=0.0.13"]
 test = ["pytest>=9.0.2"]
 types = ["pandas-stubs>=2.3.3.260113", "scipy-stubs>=1.17.0.1"]
+
+
+[tool.numpydoc_validation]
+checks = [
+  "GL05",
+  "GL08",
+  "GL10",
+  "PR01",
+  "PR02",
+  "PR03",
+  "PR04",
+  "PR05",
+  "PR06",
+  "PR07",
+  "RT01",
+  "RT02",
+  "RT03",
+  "RT04",
+  "YD01",
+]
+# remember to use single quotes for regex in TOML
+exclude = [ # don't report on objects that match any of these regex
+  '\.undocumented_method$',
+  '\.__repr__$',
+]

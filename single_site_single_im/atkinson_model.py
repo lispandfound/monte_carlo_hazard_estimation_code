@@ -1,6 +1,7 @@
+"""Module to compute ground motion models for simulations"""
+
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Literal
 
 import cyclopts
 import pandas as pd

@@ -1,0 +1,54 @@
+---
+# Runs just before you commit. Other options include commit-msg,
+# pre-push, post-commit, etc.
+pre-commit:
+  parallel: true
+
+  commands:
+    ty:
+      # Use uv run when you want a command to run in your environment.
+      # Here we want ty to have access to the stubs packages installed
+      # for type checking.
+      run: uv run --extra dev --extra types ty check {staged_files}
+      glob: "*.py"
+
+    ruff:
+      # Use uvx here because it is independent of the environment.
+      # can also use uv run it is just more portable.
+      run: uvx ruff check --fix {staged_files}
+      glob: "*.py"
+      # Automatically stage the changes that ruff suggests (e.g.
+      # deleting/rearranging unused imports)
+      stage_fixed: true
+
+    yaml:
+      run: uvx yamllint {staged_files}
+      glob: "*.yaml"
+
+    numpydoc:
+      # numpydoc dumps to stderr, but lefthook expects stdout
+      run: uvx numpydoc lint {staged_files} 2>&1
+      glob: "*.py"
+      env:
+        # numpydoc has warnings about unknown doc sections that we just ignore.
+        PYTHONWARNINGS: ignore
+      exclude:
+        - "*/__init__.py"
+        - "tests/*"
+        - setup.py
+
+    dependencies:
+      glob: "*.py"
+      # Needs to run with uv run because deptry needs access to the
+      # environment dependencies.
+      run: uv run --extra dev deptry . -ddg dev,types,test
+
+    clippy:
+      # Unless you have a rust package in the repo this is skipped
+      glob: "*.rs"
+      env:
+        RUSTFLAGS: "-Dwarnings"
+      run: cargo clippy --fix --allow-dirty --allow-staged
+      # Once again, clippy will auto fix some problems, so we
+      # automatically stage the changes.
+      stage_fixed: true

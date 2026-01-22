@@ -1,3 +1,5 @@
+"""Pre-compute rupture dataframes for a given site."""
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict
@@ -7,7 +9,6 @@ import numpy as np
 import pandas as pd
 import tqdm
 from nshmdb.nshmdb import NSHMDB, Rupture
-from webob.exc import HTTPNonAuthoritativeInformation
 
 app = cyclopts.App()
 
@@ -105,6 +106,21 @@ class RuptureRow(TypedDict):
 
 
 def compile_rupture_dataframe(db: NSHMDB, site: Site) -> pd.DataFrame:
+    """Compile the rupture dataframe for a site.
+
+    Parameters
+    ----------
+    db : NSHMDB
+        The NSHMDB to extract from.
+    site : Site
+        The site to compute for.
+
+    Returns
+    -------
+    pd.DataFrame
+        A dataframe containing rupture id, magnitude, vs30, rrup and
+        rupture rate.
+    """
     rupture_rows = []
     ruptures = extract_all_ruptures(db)
     print(f"Found {len(ruptures)} ruptures to add")
