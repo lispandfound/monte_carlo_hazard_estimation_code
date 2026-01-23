@@ -10,7 +10,7 @@ import scipy as sp  # For log normal CDF
 HazardMatrix = np.ndarray[tuple[int, int], np.dtype[np.floating]]
 
 
-def rupture_hazard(
+def analytical_hazard(
     rate: npt.ArrayLike,
     log_im_mean: npt.ArrayLike,
     log_im_stddev: npt.ArrayLike,
@@ -61,7 +61,7 @@ HazardFunction = Callable[
 ]
 
 
-def analytical_psha(
+def calculate_hazard(
     rupture_df: pd.DataFrame,
     threshold_values: npt.NDArray[np.floating],
     hazard_function: HazardFunction,
