@@ -56,6 +56,72 @@ def analytical_hazard(
     )
 
 
+def naive_monte_carlo_rupture_hazard(
+    rate: npt.ArrayLike,
+    log_im_mean: npt.ArrayLike,
+    log_im_stddev: npt.ArrayLike,
+    threshold: npt.ArrayLike,
+    samples: npt.ArrayLike,
+) -> npt.NDArray[np.floating]:
+    r"""Compute rupture hazard using Naive Monte Carlo method.
+
+    Assumes intensity measure is log-normally distributed with ``s=log_im_stddev`` and ``scale=exp(log_im_mean)``.
+    Computes hazard using the estimator
+
+    $$ \frac{1}{N} \sum_{i = 1}^N I(X_i > \text{threshold}),$$
+
+    where $X_i$ is a ground motion sampled from the log-normal
+    intensity measure distribution and $N$ is the number of samples
+    per rupture.
+
+
+    Parameters
+    ----------
+    rate : ArrayLike
+       Rupture rate(s) for the sources.
+    log_im_mean : ArrayLike
+       Log of the mean intensity measure value.
+    log_im_stddev : ArrayLike
+       Log of the intensity measure std. deviation.
+    threshold : ArrayLike
+       Threshold values of the intensity measure to compute hazard
+       for. For example, if the intensity measure is PGA, then
+       threshold may take a value of 0.65g.
+    samples : ArrayLike
+       Number of samples for each rupture. Used to estimate hazard for each individual rupture.
+
+    Returns
+    -------
+    ArrayLike
+        Hazard for each rate, intensity measure distribution, and
+        threshold value given.
+
+    See Also
+    --------
+    sp.stats.lognorm : For the description of the ``s`` and ``scale`` parameters.
+    """
+
+    rate = np.asarray(rate)
+    log_im_mean = np.asarray(log_im_mean)
+    log_im_stddev = np.asarray(log_im_stddev)
+    threshold = np.asarray(threshold)
+    samples = np.asarray(samples)
+    n_rup = len(samples)
+    n_thresh = len(threshold)
+    hazard_matrix = np.zeros((n_rup, n_thresh), np.float64)
+    for i, (n, rup_rate, rup_im_mean, rup_im_stddev) in enumerate(
+        zip(samples, rate, log_im_mean, log_im_stddev)
+    ):
+        im_samples = sp.stats.lognorm.rvs(
+            s=rup_im_stddev, scale=np.exp(rup_im_mean), size=n
+        )
+        hazard_matrix[i] = rup_rate * (threshold[:, np.newaxis] <= im_samples).mean(
+            axis=1
+        )
+
+    return hazard_matrix
+
+
 HazardFunction = Callable[
     [npt.ArrayLike, npt.ArrayLike, npt.ArrayLike, npt.ArrayLike], HazardMatrix
 ]
