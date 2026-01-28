@@ -14,4 +14,4 @@ naive_strategy:
 
 
 compare_strategies:
-    uv run single_site_single_im/monte_carlo_experiment.py compare data/strategies.toml data/CBGS_gmm.parquet figures/strategy_comparison.png --subwidth 6 --subheight 6
+    uv run single_site_single_im/monte_carlo_experiment.py compare strategies.toml data/CBGS_gmm.parquet figures/strategy_comparison.png --subwidth 6 --subheight 6

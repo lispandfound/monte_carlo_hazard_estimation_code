@@ -1,0 +1,22 @@
+[bootstrap]
+n_resamples = 250
+
+[strategies.poisson_short]
+type = "poisson"
+length = 50000
+color = "springgreen"
+
+[strategies.poisson_long]
+type = 'poisson'
+length = 200000
+color = "green"
+
+[strategies.naive_short]
+type = 'naive'
+n = 2
+color = "lightsalmon"
+
+[strategies.naive_long]
+type = 'naive'
+n = 10
+color = "red"
