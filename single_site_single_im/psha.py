@@ -1,22 +1,56 @@
 """Analytically integrate PSHA to obtain a hazard curve"""
 
-import functools
-from typing import Any, Callable, NamedTuple
+from dataclasses import dataclass
+from typing import Callable, NamedTuple, Protocol
 
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
 import scipy as sp  # For log normal CDF
 import tqdm
+from numpy.random import Generator
 
-HazardMatrix = np.ndarray[tuple[int, int], np.dtype[np.floating]]
+Array1 = np.ndarray[tuple[int,], np.dtype[np.float64]]
+IArray1 = np.ndarray[tuple[int,], np.dtype[np.int64]]
+HazardMatrix = np.ndarray[tuple[int, int], np.dtype[np.float64]]
+
+
+@dataclass
+class SourceModel:
+    """Clean arrays extracted from the raw dataframe."""
+
+    rates: Array1
+    log_means: Array1
+    log_stds: Array1
+
+    def __post_init__(self):
+        self.rates = np.asarray(self.rates)
+        self.log_means = np.asarray(self.log_means)
+        self.log_stds = np.asarray(self.log_stds)
+
+
+@dataclass
+class SimulationPlan:
+    """The instruction set for the simulation kernel."""
+
+    counts: IArray1
+    weights: Array1
+
+    def __post_init__(self):
+        self.counts = np.asarray(self.counts)
+        self.weights = np.asarray(self.weights)
+
+
+class SamplingStrategy(Protocol):
+    def __call__(
+        self, sources: pd.DataFrame, rng: Generator
+    ) -> SimulationPlan: ...  # numpydoc ignore=GL08
 
 
 def analytical_hazard(
-    rate: npt.ArrayLike,
-    log_im_mean: npt.ArrayLike,
-    log_im_stddev: npt.ArrayLike,
+    source_model: SourceModel,
     threshold: npt.ArrayLike,
+    rng: Generator | None = None,
 ) -> npt.NDArray[np.floating]:
     r"""Compute rupture hazard using analytical result.
 
@@ -48,23 +82,45 @@ def analytical_hazard(
     sp.stats.lognorm : For the description of the ``s`` and ``scale`` parameters.
     """
 
-    rate = np.asarray(rate)
-    log_im_mean = np.asarray(log_im_mean)
-    log_im_stddev = np.asarray(log_im_stddev)
     threshold = np.asarray(threshold)
-
-    return rate * sp.stats.lognorm.sf(
-        threshold, s=log_im_stddev, scale=np.exp(log_im_mean)
+    return source_model.rates[:, None] * sp.stats.lognorm.sf(
+        threshold,
+        s=source_model.log_stds[:, None],
+        scale=np.exp(source_model.log_means[:, None]),
     )
 
 
+def _threshold_reduction(
+    ground_motions: Array1, samples: IArray1, thresholds: Array1
+) -> HazardMatrix:
+    """Inner function that efficiently computes the entries in the hazard matrix.
+
+    Parameters
+    ----------
+    ground_motions : Array1
+        Ground motions sampled from monte carlo simulations.
+    samples : IArray1
+        Number of samples for each ruptures.
+    thresholds : Array1
+        Thresholds to measure exceedence.
+
+    Returns
+    -------
+    HazardMatrix
+        Raw hazard matrix, ``H[i, j]`` counts the number of times
+        rupture ``i`` exceeds threshold ``j``.
+    """
+
+    indices = np.cumulative_sum(samples, include_initial=True)[:-1]
+    exceedances = ground_motions[:, np.newaxis] >= thresholds[np.newaxis, :]
+    hazard_matrix = np.add.reduceat(exceedances, indices, axis=0)
+
+    return hazard_matrix.astype(np.float64)
+
+
 def monte_carlo_rupture_hazard(
-    log_im_mean: npt.ArrayLike,
-    log_im_stddev: npt.ArrayLike,
-    threshold: npt.ArrayLike,
-    samples: npt.ArrayLike,
-    weights: npt.ArrayLike,
-) -> npt.NDArray[np.floating]:
+    model: SourceModel, plan: SimulationPlan, thresholds: Array1, rng: Generator
+) -> HazardMatrix:
     r"""Compute rupture hazard using Naive Monte Carlo method.
 
     Assumes intensity measure is log-normally distributed with ``s=log_im_stddev`` and ``scale=exp(log_im_mean)``.
@@ -79,197 +135,231 @@ def monte_carlo_rupture_hazard(
 
     Parameters
     ----------
-    rate : ArrayLike
-       Rupture rate(s) for the sources.
-    log_im_mean : ArrayLike
-       Log of the mean intensity measure value.
-    log_im_stddev : ArrayLike
-       Log of the intensity measure std. deviation.
-    threshold : ArrayLike
-       Threshold values of the intensity measure to compute hazard
-       for. For example, if the intensity measure is PGA, then
-       threshold may take a value of 0.65g.
-    samples : ArrayLike
-       Number of samples for each rupture. Used to estimate hazard for each individual rupture.
-    weights : ArrayLike
-       Weights for each rupture. Used for importance sampling.
+    model : SourceModel
+        Empirical ground motion model for each rupture to draw samples from.
+    plan : SimulationPlan
+        Sampling strategy and weights for Monte Carlo trials
+    thresholds : array of floats
+        Threshold values to sample from.
 
     Returns
     -------
-    ArrayLike
-        Hazard for each rate, intensity measure distribution, and
-        threshold value given.
-
-    See Also
-    --------
-    sp.stats.lognorm : For the description of the ``s`` and ``scale`` parameters.
+    array of floats
+        Aggregate hazard for each threshold value given.
     """
+    means_flat = np.repeat(model.log_means, plan.counts)
+    stds_flat = np.repeat(model.log_stds, plan.counts)
 
-    log_im_mean = np.asarray(log_im_mean)
-    log_im_stddev = np.asarray(log_im_stddev)
-    threshold = np.asarray(threshold)
-    samples = np.asarray(samples)
-    weights = np.asarray(weights)
-    n_rup = len(samples)
-    n_thresh = len(threshold)
-    hazard_matrix = np.zeros((n_rup, n_thresh), np.float64)
-    for i, (n, weight, rup_im_mean, rup_im_stddev) in enumerate(
-        zip(samples, weights, log_im_mean, log_im_stddev)
-    ):
-        if n == 0:
-            continue
-        im_samples = sp.stats.lognorm.rvs(
-            s=rup_im_stddev, scale=np.exp(rup_im_mean), size=n
-        )
-        hazard_matrix[i] = weight * (threshold[:, np.newaxis] <= im_samples).sum(axis=1)
+    ground_motions = sp.stats.lognorm.rvs(
+        s=stds_flat, scale=np.exp(means_flat), random_state=rng
+    )
 
-    return hazard_matrix
+    raw_matrix = _threshold_reduction(ground_motions, plan.counts, thresholds)
 
-
-HazardFunction = Callable[[npt.ArrayLike, npt.ArrayLike, npt.ArrayLike], HazardMatrix]
-
-
-def calculate_hazard(
-    rupture_df: pd.DataFrame,
-    threshold_values: npt.NDArray[np.floating],
-    hazard_function: HazardFunction,
-    rate_col: str = "rate",
-    mean_col: str = "PGA_mean",
-    stddev_col: str = "PGA_std_Total",
-) -> pd.DataFrame:
-    """Simulate and aggregate hazard over a number of ruptures.
-
-    Takes in a rupture dataframe describing the intensity measure
-    distribution and some threshold values. Uses ``rupture_hazard`` to
-    estimate the probability of threshold exceedence at
-    ``threshold_values`` using ``hazard_function`` and aggregates the
-    results over all ruptures.
-
-    Parameters
-    ----------
-    rupture_df : pd.DataFrame
-        The dataframe of ruptures. Must have ``rate``, ``PGA_mean``
-        and ``PGA_std_Total`` columns.
-    threshold_values : npt.NDArray[np.floating]
-        Threshold values for test for.
-    hazard_function : HazardFunction
-        Hazard function to estimate each hazard for each rupture. Must
-        accept an array of rates, means and stddev with shape (N_rup,
-        1) each. Must return hazard in the shape (N_rup, N_thresh).
-    rate_col : str, optional
-        The rate column to extract from ``rupture_df``.
-    mean_col : str, optional
-        The mean column to extract from ``rupture_df``.
-    stddev_col : str, optional
-        The stddev column to extract from ``rupture_df``.
-
-    Returns
-    -------
-    pd.DataFrame
-        A dataframe of hazard values aggregated over each rupture
-        (i.e. a hazard curve). Indexed by ``threshold_values``. The
-        ``hazard`` column contains hazard results.
-    """
-    means = np.asarray(rupture_df[mean_col].values)[:, None]
-    stddevs = np.asarray(rupture_df[stddev_col].values)[:, None]
-
-    hazard_matrix = hazard_function(means, stddevs, threshold_values)
-    hazard_vec = hazard_matrix.sum(axis=0)
-    return pd.DataFrame(
-        {"threshold": threshold_values, "hazard": hazard_vec}
-    ).set_index("threshold")
+    weighted_hazard = raw_matrix * plan.weights[:, np.newaxis]
+    return weighted_hazard.sum(axis=0)
 
 
 class BootstrapResult(NamedTuple):
+    """Namedtuple containing bootstrap results."""
+
     ci_low: np.ndarray[tuple[int,], np.dtype[np.float64]]
     ci_high: np.ndarray[tuple[int,], np.dtype[np.float64]]
+    mean: np.ndarray[tuple[int,], np.dtype[np.float64]]
     variance: np.ndarray[tuple[int,], np.dtype[np.float64]]
     samples: np.ndarray[tuple[int, int], np.dtype[np.float64]]
-    thresholds: np.ndarray[tuple[int,], np.dtype[np.float64]]
 
 
-def bootstrap_sampling_strategy(
-    strategy: Callable[[pd.DataFrame], pd.DataFrame],
-    rupture_df: pd.DataFrame,
-    threshold_values: npt.ndarray[tuple[int,], np.dtype[np.float64]],
-    n_resamples: int = 1000,
-    **kwargs: Any,
+def run_bootstrap(
+    simulation_fn: Callable[[], np.ndarray],
+    n_resamples: int,
+    use_tqdm: bool = True,
+    tqdm_desc: str = "Bootstrapping",
 ) -> BootstrapResult:
-    """Bootstrap a rupture sampling strategy.
+    """
+    Pure orchestration.
+    simulation_fn is a pre-configured closure that returns a single hazard curve.
+    """
+    results = []
+    iter = tqdm.trange(n_resamples, desc=tqdm_desc) if use_tqdm else range(n_resamples)
+    for _ in iter:
+        results.append(simulation_fn())
+
+    samples = np.stack(results, axis=0)  # Shape: (N_boot, N_thresh)
+    return BootstrapResult(
+        mean=np.mean(samples, axis=0),
+        ci_low=np.percentile(samples, 2.5, axis=0),
+        ci_high=np.percentile(samples, 97.5, axis=0),
+        variance=np.var(samples, axis=0),
+        samples=samples,
+    )
 
 
+def naive_strategy(ruptures: pd.DataFrame, n: int) -> SimulationPlan:
+    """Naive monte carlo strategy where every rupture is sampled an equal number of times.
 
     Parameters
     ----------
-    strategy : pd.DataFrame
-        The rupture sampling plan, must have a ``samples`` column, may
-        have a ``weights`` column for importance or stratified
-        sampling.
+    ruptures : pd.DataFrame
+        Ruptures to sample.
+    n : int
+        The number of samples per rupture.
 
+    Returns
+    -------
+    SimulationPlan
+        A naive simulation strategy sampling every rupture exactly ``n`` times.
+    """
+    return SimulationPlan(
+        counts=np.full(len(ruptures), n, dtype=np.int64),
+        weights=np.full(len(ruptures), ruptures["rate"] / n, dtype=np.float64),
+    )
+
+
+def poisson_strategy(df: pd.DataFrame, rng: Generator, length: float) -> SimulationPlan:
+    """Poisson catalogue sampling strategy.
+
+    Sampling strategy implemented from [0]_.
+
+    Parameters
+    ----------
+    ruptures : pd.DataFrame
+        Ruptures to sample.
+    length : float
+        Length of synthetic catalogue (in years).
 
     Returns
     -------
     pd.DataFrame
-        Hazard curves bootstrapped from the sampling strategy.
+        A strategy dataframe.
+
+    Reference
+    ---------
+    .. [0] Azar, S., & Dabaghi, M. (2021). Simulation-Based Seismic
+    Hazard Assessment Using Monte-Carlo Earthquake Catalogs:
+    Application to CyberShake. Bulletin of the Seismological Society
+    of America, 111(3), 1481–1493. https://doi.org/10.1785/0120200375
     """
-
-    estimates = []
-    for _ in tqdm.trange(n_resamples, unit="samples", **kwargs):
-        strategy_df = strategy(rupture_df)
-        weights = (
-            strategy_df["weights"]
-            if "weights" in strategy_df.columns
-            else np.ones_like(strategy_df["samples"])
-        )
-        estimates.append(
-            np.asarray(
-                calculate_hazard(
-                    rupture_df,
-                    threshold_values,
-                    hazard_function=functools.partial(
-                        monte_carlo_rupture_hazard,
-                        samples=strategy_df["samples"],
-                        weights=weights,
-                    ),
-                )["hazard"].values
-            )
-        )
-    estimates = np.stack(
-        estimates,
-        axis=1,
-    )
-    ci_low = np.percentile(estimates, 5, axis=-1)
-    ci_high = np.percentile(estimates, 95, axis=-1)
-    variance = np.var(estimates, axis=1)
-    return BootstrapResult(
-        ci_low=ci_low,
-        ci_high=ci_high,
-        variance=variance,
-        samples=estimates,
-        thresholds=threshold_values,
-    )
-
-
-def naive_monte_carlo_sampling_strategy(ruptures: pd.DataFrame, n: int) -> pd.DataFrame:
-    return pd.DataFrame(
-        {"samples": np.full_like(ruptures.index, n), "weights": ruptures["rate"] / n},
-        index=ruptures.index,
-    )
-
-
-def poisson_catalogue_sampling_strategy(
-    ruptures: pd.DataFrame, length: float
-) -> pd.DataFrame:
-    samples = sp.stats.poisson(mu=ruptures["rate"] * length).rvs()
-    weights = np.full(len(ruptures), 1 / length)
-    return pd.DataFrame(
-        {
-            "samples": samples,
-            "weights": weights,
-        },
-        index=ruptures.index,
-    )
+    rates = np.asarray(df["rate"].values)
+    counts = sp.stats.poisson.rvs(rates * length, random_state=rng).astype(np.int64)
+    weights = np.full(len(df), 1.0 / length)
+    return SimulationPlan(counts=counts, weights=weights)
 
 
 def poisson_mean_ruptures_sampled(ruptures: pd.DataFrame, length: float) -> int:
+    """Counts the average number of sampled ruptures the poisson strategy produces for a given length.
+
+    Parameters
+    ----------
+    ruptures : pd.DataFrame
+        Ruptures that would be sampled.
+    length : float
+        Length of the synthetic catalogue (in years).
+
+    Returns
+    -------
+    int
+        The expected number of ruptures, rounded to the nearest
+        rupture.
+
+    See Also
+    --------
+    poisson_catalogue_sampling_strategy : The sampling strategy this counts the mean samples for.
+    """
     return round(ruptures["rate"].sum() * length)
+
+
+def cybershake_nz_strategy(ruptures: pd.DataFrame) -> SimulationPlan:
+    """Cybershake New Zealand baseline rupture strategy.
+
+    Samples ruptures proportional to their magnitude. Higher
+    magnitudes are sampled more often. Ruptures below magnitude 6 and
+    above magnitude 8 are clipped to 14 and 68 samples respectively.
+
+    Parameters
+    ----------
+    ruptures : pd.DataFrame
+        Ruptures that would be sampled.
+
+    Returns
+    -------
+    SimulationPlan
+        A simulation plan implementing the Cybershake NZ sampling method.
+    """
+    magnitude = ruptures["mag"]
+    counts = np.round(np.clip(27 * magnitude - 148, 14, 68)).astype(np.int64)
+    weights = ruptures["rate"] / counts
+    return SimulationPlan(counts=counts, weights=weights)
+
+
+SCEC_SAMPLING_SPACE = 4.0
+
+
+def scec_cybershake_strategy(
+    ruptures: pd.DataFrame, hypocentre_spacing: float
+) -> SimulationPlan:
+    """SCEC Cybershake sampling strategy [0]_.
+
+    Samples ruptures proportional to area. Larger faults are sampled more often.
+
+    Parameters
+    ----------
+    ruptures : pd.DataFrame
+        Ruptures to sample.
+    hypocentre_spacing : float
+        Spacing for hypocentre distribution.
+
+    Returns
+    -------
+    pd.DataFrame
+        A sampling strategy.
+
+    Notes
+    -----
+    Exact formula is ``A / (H^2)`` where ``A`` is area and ``H``
+    hypocentre spacing. The default hypocentre spacing is set to 4km
+    after personal communication with Scott Callaghan.
+
+    References
+    ----------
+    .. [0] Rupture Variation Generator V5.4.2 - SCECpedia. (n.d.). Retrieved January 29, 2026, from https://strike.scec.org/scecpedia/Rupture_Variation_Generator_v5.4.2#target_hypo_spacing
+
+    See Also
+    --------
+    SCEC_SAMPLING_SPACE : The SCEC default sample spacing.
+    """
+    area = ruptures["area"]
+    # Hypocentres in the SCEC sampling strategy are placed every 4km
+    # along-strike and down-dip. This means l/4 * w/4 = lw / 16
+    # samples. Note length * width != area in general due to shearing
+    # of fault planes when dip dir is not strike + 90. However, it is
+    # a good enough approximation that I will use area as a stand-in
+    # for length * width here.
+    counts = (area / (hypocentre_spacing * hypocentre_spacing) + 0.5).astype(np.int64)
+    weights = ruptures["rate"] / counts
+    return SimulationPlan(counts=counts, weights=weights)
+
+
+def fixed_effort_poisson_strategy(
+    ruptures: pd.DataFrame, rng: Generator, n: int
+) -> SimulationPlan:
+    probabilities = ruptures["rate"] / ruptures["rate"].sum()
+    return importance_sampled_strategy(ruptures, probabilities, rng, n)
+
+
+def importance_sampled_strategy(
+    ruptures: pd.DataFrame,
+    rupture_prob_distribution: pd.Series,
+    rng: Generator,
+    n: int,
+) -> SimulationPlan:
+    rupture_prob_distribution = rupture_prob_distribution.loc[ruptures.index]
+    counts = rng.multinomial(n, rupture_prob_distribution)
+
+    weights = (
+        ruptures["rate"]
+        .div(rupture_prob_distribution * n)
+        .replace([np.inf, -np.inf], 0)
+        .fillna(0)
+    )
+    return SimulationPlan(counts=counts, weights=weights)

@@ -103,6 +103,7 @@ class RuptureRow(TypedDict):
     mag: float
     vs30: float
     rrup: float
+    area: float
     rate: float
 
 
@@ -125,9 +126,10 @@ def compile_rupture_dataframe(db: NSHMDB, site: Site) -> pd.DataFrame:
     rupture_rows = []
     ruptures = extract_all_ruptures(db)
     print(f"Found {len(ruptures)} ruptures to add")
-    for rupture in tqdm.tqdm(ruptures, desc="Measuring distances", unit="ruptures"):
+    for rupture in tqdm.tqdm(ruptures, desc="Compiling dataframe", unit="ruptures"):
         rrup_metres = measure_site_distance(rupture, site)
         rrup_kilomtres = rrup_metres / 1000.0
+
         rupture_rows.append(
             RuptureRow(
                 rupture_id=rupture.rupture_id,
@@ -135,6 +137,7 @@ def compile_rupture_dataframe(db: NSHMDB, site: Site) -> pd.DataFrame:
                 vs30=site.vs30,
                 rrup=rrup_kilomtres,
                 rate=rupture.rate,
+                area=sum(fault.area() for fault in rupture.faults.values()),
             )
         )
 

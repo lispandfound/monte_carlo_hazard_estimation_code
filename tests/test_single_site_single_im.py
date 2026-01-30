@@ -1,19 +1,19 @@
 """Tests for the single-site single-im experiment"""
 
-from unittest.mock import Mock
 
 import numpy as np
-import pandas as pd
 import pytest
 from single_site_single_im import psha
+from single_site_single_im.psha import SourceModel
 
 
 def test_rupture_hazard_monotonically_decreasing() -> None:
     """Asserts that hazard decreases monotonically with threshold."""
     thresholds = np.linspace(0.01, 2.0, 10)
-    results = psha.analytical_hazard(
-        rate=0.1, log_im_mean=0, log_im_stddev=0.5, threshold=thresholds
+    source_model = SourceModel(
+        rates=np.array([0.1]), log_means=np.array([0]), log_stds=np.array([0.5])
     )
+    results = psha.analytical_hazard(source_model, thresholds)
 
     # Check that hazard decreases as threshold increases
     assert np.all(np.diff(results) <= 0)
@@ -22,39 +22,54 @@ def test_rupture_hazard_monotonically_decreasing() -> None:
 def test_rupture_hazard_mean_rate() -> None:
     """Asserts that hazard at the mean im value is 0.5."""
     threshold = 1.0
-    result = psha.analytical_hazard(
-        rate=1.0, log_im_mean=np.log(threshold), log_im_stddev=0.5, threshold=threshold
+    source_model = SourceModel(
+        rates=np.array([1.0]),
+        log_means=np.array([np.log(threshold)]),
+        log_stds=np.array([0.5]),
     )
+    result = psha.analytical_hazard(source_model, np.array([threshold]))
 
-    assert result == pytest.approx(0.5)
+    assert result.squeeze().item() == pytest.approx(0.5)
 
 
 def test_rupture_hazard_approaches_rupture_rate() -> None:
     """Test rupture rate bounds hazard as threshold -> 0."""
     threshold = 1e-5
     rate = 1.0
-    result = psha.analytical_hazard(
-        rate=rate, log_im_mean=-0.5, log_im_stddev=0.5, threshold=threshold
+    source_model = SourceModel(
+        rates=np.array([rate]),
+        log_means=np.array([-0.5]),
+        log_stds=np.array([0.5]),
     )
+    result = psha.analytical_hazard(source_model, np.array([threshold]))
 
     assert result == pytest.approx(rate)
 
 
-def test_rupture_hazard_approaches_zero() -> None:
-    """Test hazard approaches zero as threshold -> infty."""
+def test_rupture_hazard_approaches_zero_for_large_threshold() -> None:
+    """Test hazard approaches 0 as threshold -> infty."""
     threshold = 1e10
-    rate = 1.0
-    result = psha.analytical_hazard(
-        rate=rate, log_im_mean=-0.5, log_im_stddev=0.5, threshold=threshold
+    source_model = SourceModel(
+        rates=np.array([1.0]),
+        log_means=np.array([-0.5]),
+        log_stds=np.array([0.5]),
     )
+    result = psha.analytical_hazard(source_model, np.array([threshold]))
 
     assert result == pytest.approx(0)
 
 
-def test_rupture_hazard_zero_rate() -> None:
-    """Asserts that hazard with no rate is 0."""
-    res = psha.analytical_hazard(rate=0, log_im_mean=1, log_im_stddev=1, threshold=0.5)
-    assert res == 0
+def test_rupture_hazard_with_zero_rate_is_zero() -> None:
+    """Test hazard is 0 if rate is 0."""
+    threshold = 0.5
+    source_model = SourceModel(
+        rates=np.array([0.0]),
+        log_means=np.array([-0.5]),
+        log_stds=np.array([0.5]),
+    )
+    result = psha.analytical_hazard(source_model, np.array([threshold]))
+
+    assert result == pytest.approx(0)
 
 
 def test_rupture_hazard_shape():
@@ -63,13 +78,13 @@ def test_rupture_hazard_shape():
     n_thresholds = 50
 
     # Create dummy inputs
-    rates = np.random.rand(n_ruptures, 1)
-    means = np.random.rand(n_ruptures, 1)
-    stddevs = np.random.rand(n_ruptures, 1)
+    rates = np.random.rand(n_ruptures)
+    means = np.random.rand(n_ruptures)
+    stddevs = np.random.rand(n_ruptures)
     thresholds = np.geomspace(1e-3, 2, num=n_thresholds)
+    source_model = SourceModel(rates=rates, log_means=means, log_stds=stddevs)
 
-    # Execute
-    result = psha.analytical_hazard(rates, means, stddevs, thresholds)
+    result = psha.analytical_hazard(source_model, thresholds)
 
     # Assertions
     assert result.shape == (n_ruptures, n_thresholds), (
@@ -87,16 +102,12 @@ def test_rupture_hazard_threshold_order():
 
     # Using fixed rates to ensure we don't hit edge cases of zero probability
     # that might make the test pass accidentally.
-    rates = np.full((n_ruptures, 1), 1.0)
-    means = np.full((n_ruptures, 1), 0.5)
-    stddevs = np.full((n_ruptures, 1), 0.2)
+    rates = np.full((n_ruptures,), 1.0)
+    means = np.full((n_ruptures,), 0.5)
+    stddevs = np.full((n_ruptures,), 0.2)
     thresholds = np.geomspace(1e-3, 2, num=n_thresholds)
-
-    result = psha.analytical_hazard(rates, means, stddevs, thresholds)
-
-    assert result.shape == (n_ruptures, n_thresholds), (
-        f"Expected shape ({n_ruptures}, {n_thresholds}), but got {result.shape}"
-    )
+    source_model = SourceModel(rates=rates, log_means=means, log_stds=stddevs)
+    result = psha.analytical_hazard(source_model, thresholds)
 
     # Check monotonicity along axis 1 (the threshold axis)
     diffs = np.diff(result, axis=1)
@@ -104,212 +115,3 @@ def test_rupture_hazard_threshold_order():
         "Hazard does not monotonically decrease with increasing thresholds. "
         f"Found {np.sum(diffs > 0)} violations."
     )
-
-
-def test_analytical_psha_calls_hazard_function_correctly():
-    """Test that hazard function is called with correct shape and values."""
-    # Setup
-    rupture_df = pd.DataFrame(
-        {"rate": [0.1, 0.2], "PGA_mean": [-1.0, -0.5], "PGA_std_Total": [0.5, 0.6]}
-    )
-    threshold_values = np.array([0.01, 0.1, 1.0])
-
-    # Mock hazard function
-    mock_hazard = Mock(return_value=np.array([[0.05, 0.03, 0.01], [0.10, 0.07, 0.02]]))
-
-    # Execute
-    _ = psha.calculate_hazard(rupture_df, threshold_values, mock_hazard)
-
-    # Assert: hazard function called once
-    assert mock_hazard.call_count == 1
-
-    # Check arguments passed to hazard function
-    call_args = mock_hazard.call_args[0]
-    rates, means, stddevs, thresholds = call_args
-
-    # Check shapes: (N_rup, 1) for rates, means, stddevs
-    assert rates.shape == (2, 1)
-    assert means.shape == (2, 1)
-    assert stddevs.shape == (2, 1)
-    assert thresholds.shape == (3,)
-
-    # Check values
-    assert rates.flatten() == pytest.approx([0.1, 0.2])
-    assert means.flatten() == pytest.approx([-1.0, -0.5])
-    assert stddevs.flatten() == pytest.approx([0.5, 0.6])
-    assert thresholds == pytest.approx(threshold_values)
-
-
-def test_analytical_psha_aggregates_hazard_correctly():
-    """Test that hazard values are summed across ruptures."""
-    rupture_df = pd.DataFrame(
-        {"rate": [0.1, 0.2], "PGA_mean": [-1.0, -0.5], "PGA_std_Total": [0.5, 0.6]}
-    )
-    threshold_values = np.array([0.01, 0.1, 1.0])
-
-    # Mock returns (N_rup, N_thresh) array
-    mock_hazard = Mock(return_value=np.array([[0.05, 0.03, 0.01], [0.10, 0.07, 0.02]]))
-
-    result = psha.calculate_hazard(rupture_df, threshold_values, mock_hazard)
-
-    # Expected: sum along axis 0 -> [0.15, 0.10, 0.03]
-    expected_hazard = np.array([0.15, 0.10, 0.03])
-    assert result["hazard"].values == pytest.approx(expected_hazard)
-
-
-def test_analytical_psha_returns_correct_structure():
-    """Test output dataframe structure."""
-    rupture_df = pd.DataFrame(
-        {"rate": [0.1], "PGA_mean": [-1.0], "PGA_std_Total": [0.5]}
-    )
-    threshold_values = np.array([0.01, 0.1, 1.0])
-
-    mock_hazard = Mock(return_value=np.array([[0.05, 0.03, 0.01]]))
-
-    result = psha.calculate_hazard(rupture_df, threshold_values, mock_hazard)
-
-    # Check structure
-    assert isinstance(result, pd.DataFrame)
-    assert result.index.name == "threshold"
-    assert "hazard" in result.columns
-    assert len(result.columns) == 1
-    assert len(result) == len(threshold_values)
-
-    # Check index values
-    assert result.index.values == pytest.approx(threshold_values)
-
-
-def test_analytical_psha_custom_column_names():
-    """Test that custom column names are used correctly."""
-    rupture_df = pd.DataFrame(
-        {"annual_rate": [0.1, 0.2], "mu_log": [-1.0, -0.5], "sigma_log": [0.5, 0.6]}
-    )
-    threshold_values = np.array([0.01, 0.1])
-
-    mock_hazard = Mock(return_value=np.array([[0.05, 0.03], [0.10, 0.07]]))
-
-    _ = psha.calculate_hazard(
-        rupture_df,
-        threshold_values,
-        mock_hazard,
-        rate_col="annual_rate",
-        mean_col="mu_log",
-        stddev_col="sigma_log",
-    )
-
-    # Verify correct columns were extracted
-    call_args = mock_hazard.call_args[0]
-    rates, means, stddevs, _ = call_args
-
-    assert rates.flatten() == pytest.approx([0.1, 0.2])
-    assert means.flatten() == pytest.approx([-1.0, -0.5])
-    assert stddevs.flatten() == pytest.approx([0.5, 0.6])
-
-
-def test_analytical_psha_missing_column_raises_error():
-    """Test that missing required columns raise KeyError."""
-    rupture_df = pd.DataFrame(
-        {
-            "rate": [0.1],
-            "PGA_mean": [-1.0],
-            # Missing PGA_std_Total
-        }
-    )
-    threshold_values = np.array([0.01])
-    mock_hazard = Mock()
-
-    with pytest.raises(KeyError):
-        psha.calculate_hazard(rupture_df, threshold_values, mock_hazard)
-
-
-def test_analytical_psha_empty_dataframe():
-    """Test with empty rupture dataframe."""
-    rupture_df = pd.DataFrame({"rate": [], "PGA_mean": [], "PGA_std_Total": []})
-    threshold_values = np.array([0.01, 0.1, 1.0])
-
-    # Mock returns empty array (0, 3)
-    mock_hazard = Mock(return_value=np.empty((0, 3)))
-
-    result = psha.calculate_hazard(rupture_df, threshold_values, mock_hazard)
-
-    # Should call hazard function with empty arrays
-    call_args = mock_hazard.call_args[0]
-    assert call_args[0].shape == (0, 1)  # rates
-
-    # Result should have zeros
-    assert len(result) == 3
-    assert result["hazard"].values == pytest.approx([0, 0, 0])
-
-
-def test_analytical_psha_single_threshold():
-    """Test with a single threshold value."""
-    rupture_df = pd.DataFrame(
-        {"rate": [0.1, 0.2], "PGA_mean": [-1.0, -0.5], "PGA_std_Total": [0.5, 0.6]}
-    )
-    threshold_values = np.array([0.5])
-
-    mock_hazard = Mock(return_value=np.array([[0.05], [0.10]]))
-
-    result = psha.calculate_hazard(rupture_df, threshold_values, mock_hazard)
-
-    assert len(result) == 1
-    assert result["hazard"].iloc[0] == pytest.approx(0.15)
-
-
-def test_analytical_psha_preserves_threshold_order():
-    """Test that threshold order is preserved in output."""
-    rupture_df = pd.DataFrame(
-        {"rate": [0.1], "PGA_mean": [-1.0], "PGA_std_Total": [0.5]}
-    )
-    # Non-monotonic thresholds
-    threshold_values = np.array([1.0, 0.01, 0.5, 0.1])
-
-    mock_hazard = Mock(return_value=np.array([[0.01, 0.09, 0.04, 0.07]]))
-
-    result = psha.calculate_hazard(rupture_df, threshold_values, mock_hazard)
-
-    # Output should maintain order
-    assert result.index.values == pytest.approx(threshold_values)
-    assert result["hazard"].values == pytest.approx([0.01, 0.09, 0.04, 0.07])
-
-
-def test_analytical_psha_hazard_function_exception_propagates():
-    """Test that exceptions from hazard function propagate."""
-    rupture_df = pd.DataFrame(
-        {"rate": [0.1], "PGA_mean": [-1.0], "PGA_std_Total": [0.5]}
-    )
-    threshold_values = np.array([0.01])
-
-    mock_hazard = Mock(side_effect=ValueError("Invalid input"))
-
-    with pytest.raises(ValueError, match="Invalid input"):
-        psha.calculate_hazard(rupture_df, threshold_values, mock_hazard)
-
-
-def test_analytical_psha_with_large_dataset():
-    """Test with larger dataset to verify aggregation."""
-    n_ruptures = 100
-    rupture_df = pd.DataFrame(
-        {
-            "rate": np.random.uniform(0.01, 0.1, n_ruptures),
-            "PGA_mean": np.random.uniform(-2, 0, n_ruptures),
-            "PGA_std_Total": np.random.uniform(0.3, 0.8, n_ruptures),
-        }
-    )
-    threshold_values = np.linspace(0.01, 2.0, 20)
-
-    # Mock returns random hazard matrix
-    mock_hazard_matrix = np.random.uniform(0, 0.1, (n_ruptures, 20))
-    mock_hazard = Mock(return_value=mock_hazard_matrix)
-
-    result = psha.calculate_hazard(rupture_df, threshold_values, mock_hazard)
-
-    # Check that hazard is correctly summed
-    expected_hazard = mock_hazard_matrix.sum(axis=0)
-    assert result["hazard"].values == pytest.approx(expected_hazard)
-
-    # Verify shape of inputs to hazard function
-    call_args = mock_hazard.call_args[0]
-    assert call_args[0].shape == (n_ruptures, 1)  # rates
-    assert call_args[1].shape == (n_ruptures, 1)  # means
-    assert call_args[2].shape == (n_ruptures, 1)  # stddevs
