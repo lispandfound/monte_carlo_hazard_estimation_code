@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from typing import Callable, NamedTuple, Protocol
 
+import numba
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
@@ -90,30 +91,26 @@ def analytical_hazard(
     )
 
 
+@numba.njit(cache=True)
 def _threshold_reduction(
-    ground_motions: Array1, samples: IArray1, thresholds: Array1
-) -> HazardMatrix:
-    """Inner function that efficiently computes the entries in the hazard matrix.
+    ground_motions: np.ndarray, samples: np.ndarray, thresholds: np.ndarray
+) -> np.ndarray:
+    # Initialize with the number of ruptures (len(samples))
+    hazard_matrix = np.zeros((len(samples), len(thresholds)), dtype=np.int64)
 
-    Parameters
-    ----------
-    ground_motions : Array1
-        Ground motions sampled from monte carlo simulations.
-    samples : IArray1
-        Number of samples for each ruptures.
-    thresholds : Array1
-        Thresholds to measure exceedence.
+    idx = 0
+    for k, sample_count in enumerate(samples):
+        if sample_count == 0:
+            continue
 
-    Returns
-    -------
-    HazardMatrix
-        Raw hazard matrix, ``H[i, j]`` counts the number of times
-        rupture ``i`` exceeds threshold ``j``.
-    """
+        # Iterate through the block of ground motions for this rupture
+        for i in range(idx, idx + sample_count):
+            gm = ground_motions[i]  # Cache the value
+            for j in range(len(thresholds)):
+                if gm >= thresholds[j]:
+                    hazard_matrix[k, j] += 1  # Use k (rupture index), not i
 
-    indices = np.cumulative_sum(samples, include_initial=True)[:-1]
-    exceedances = ground_motions[:, np.newaxis] >= thresholds[np.newaxis, :]
-    hazard_matrix = np.add.reduceat(exceedances, indices, axis=0)
+        idx += sample_count
 
     return hazard_matrix.astype(np.float64)
 
@@ -155,7 +152,6 @@ def monte_carlo_rupture_hazard(
     )
 
     raw_matrix = _threshold_reduction(ground_motions, plan.counts, thresholds)
-
     weighted_hazard = raw_matrix * plan.weights[:, np.newaxis]
     return weighted_hazard.sum(axis=0)
 
@@ -355,7 +351,6 @@ def importance_sampled_strategy(
 ) -> SimulationPlan:
     rupture_prob_distribution = rupture_prob_distribution.loc[ruptures.index]
     counts = rng.multinomial(n, rupture_prob_distribution)
-
     weights = (
         ruptures["rate"]
         .div(rupture_prob_distribution * n)

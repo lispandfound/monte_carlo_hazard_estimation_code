@@ -174,13 +174,11 @@ def create_summary_boxplots(
     true_hazard: pd.DataFrame,
 ) -> plt.Figure:
     fig, axes = plt.subplots(1, len(TARGETS), figsize=(24, 12))
-
     for ax, (title, target_rate) in zip(axes, TARGETS.items()):
         # Find the threshold index corresponding to the target rate
         idx = (true_hazard["hazard"] - target_rate).abs().idxmin()
         thresh_idx = np.argmin(np.abs(thresholds - idx))
-
-        plot_data = [res.samples[thresh_idx, :] for res in results]
+        plot_data = [res.samples[:, thresh_idx] for res in results]
         labels = [strat.label(ruptures) for strat in strategies]
         colors = [strat.color for strat in strategies]
 
