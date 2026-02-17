@@ -63,4 +63,4 @@ exclude = [ # don't report on objects that match any of these regex
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["single_site_single_im"]
+packages = ["hazard_estimation"]
