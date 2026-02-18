@@ -1,0 +1,2 @@
+min_samples = 3
+max_eps = 0.05  # No more than 30% difference in combined area

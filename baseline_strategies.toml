@@ -1,0 +1,10 @@
+[bootstrap]
+n_resamples = 250
+
+[strategies.cybershake]
+type = 'cybershake_nz'
+color = 'blue'
+
+[strategies.scec]
+type = 'scec'
+color = 'red'

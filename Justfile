@@ -1,8 +1,8 @@
 
 rupture_inputs:
     uv run hazard_estimation/generate_rupture_df.py source-model data/nshmdb.db data/inputs.parquet
-source_to_site:
-    uv run hazard_estimation/generate_rupture_df.py source-to-site data/nshmdb.db data/selected_stations.parquet data/source_to_site.parquet
+source_to_site stations="data/selected_stations.parquet":
+    uv run hazard_estimation/generate_rupture_df.py source-to-site data/nshmdb.db {{stations}} data/inputs_source_to_site.parquet
 
 single_site_cbgs_gmm im:
     uv run hazard_estimation/atkinson_model.py data/CBGS_inputs.parquet {{im}} data/CBGS_gmm.parquet

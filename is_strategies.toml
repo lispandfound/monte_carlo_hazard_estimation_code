@@ -1,0 +1,41 @@
+[bootstrap]
+n_resamples = 250
+seed = 1
+
+
+[strategies.importance_sampled_perfect_500]
+type = 'importance_sampled'
+n = 500
+distribution = 'data/hazard_based_sampling.parquet'
+color = 'purple'                                    # Lighter for lower precision
+title = 'Importance sampling with N = 500'
+
+
+[strategies.importance_sampled_perfect_1600]
+type = 'importance_sampled'
+n = 1600
+distribution = 'data/hazard_based_sampling.parquet'
+color = 'purple'                                    # Lighter for lower precision
+title = 'Importance sampling with N = 1600'
+
+
+[strategies.importance_sampled_100]
+type = 'importance_sampled'
+n = 1600
+distribution = 'data/noisy_hazard_100.parquet'
+color = 'palegreen'                                          # Lighter for lower precision
+title = 'Importance sampling with N = 1600, precision = 100'
+
+[strategies.importance_sampled_250]
+type = 'importance_sampled'
+n = 1600
+distribution = 'data/noisy_hazard_250.parquet'
+color = 'mediumseagreen'
+title = 'Importance sampling with N = 1600, precision = 250'
+
+[strategies.importance_sampled_1600]
+type = 'importance_sampled'
+n = 1600
+distribution = 'data/noisy_hazard_500.parquet'
+color = 'darkgreen'                                          # Darkest for highest precision
+title = 'Importance sampling with N = 1600, precision = 500'

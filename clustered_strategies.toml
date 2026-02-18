@@ -1,0 +1,19 @@
+[bootstrap]
+n_resamples = 250
+seed = 1
+
+[strategies.poisson_clustered]
+type = 'stratified'
+clustering_df = 'data/clustering.parquet'
+length = 50000
+color = 'red'
+
+[strategies.poisson_short]
+type = "poisson"
+length = 50000
+color = "mediumaquamarine"
+
+[strategies.poisson_long]
+type = 'poisson'
+length = 200000
+color = "darkgreen"
