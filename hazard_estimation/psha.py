@@ -1,6 +1,5 @@
 """Analytically integrate PSHA to obtain a hazard curve"""
 
-import functools
 from dataclasses import dataclass
 from typing import Callable, NamedTuple, Protocol
 
@@ -11,6 +10,7 @@ import pandas as pd
 import scipy as sp  # For log normal CDF
 import tqdm
 from numpy.random import Generator
+import oq_wrapper as oqw
 
 from hazard_estimation.site import Site
 
@@ -136,7 +136,6 @@ def analytical_hazard(
         }
     )
 
-    import oq_wrapper as oqw
 
     gmm_outputs = oqw.run_gmm(
         oqw.constants.GMM.A_22, oqw.constants.TectType.ACTIVE_SHALLOW, rupture_df, "PGA"
@@ -175,7 +174,7 @@ def _threshold_reduction(
 
 
 def monte_carlo_rupture_hazard(
-    model: SourceModel, plan: SimulationPlan, thresholds: Array1, rng: Generator
+    model: SourceModel, plan: SimulationPlan, source_to_site: SourceToSite, sites: list[Site], thresholds: Array1, rng: Generator
 ) -> HazardMatrix:
     r"""Compute rupture hazard using Naive Monte Carlo method.
 
@@ -205,16 +204,42 @@ def monte_carlo_rupture_hazard(
     array of floats
         Aggregate hazard for each threshold value given.
     """
-    means_flat = np.repeat(model.log_means, plan.counts)
-    stds_flat = np.repeat(model.log_stds, plan.counts)
-
+    # N =  N_rup * N_s
+    n_observations = plan.counts.size * len(sites)
+    # tile magnitudes to create N_s rupture catalogues
+    # M_{R1}, M_{R2}, ...
+    means_mag = np.tile(model.mean_magnitudes, len(sites))
+    stds_mag = np.tile(model.stddev_magnitudes, len(sites))
+    weights = np.tile(plan.weights, len(sites))
+    # Repeat vs30 so every (site, rup) pair is in rupture df
+    # rrup_{S1}, rrup_{S1}, ..., rrup_{S2}, ...
+    vs30 = np.asarray(np.repeat([site.vs30 for site in sites], plan.counts.size))
+    variate = sp.stats.truncnorm.rvs(size=n_observations, a=STDDEV_LOWER, b=STDDEV_UPPER)
+    mags = means_mag + stds_mag * variate
+    rupture_df = pd.DataFrame(
+            {
+                "vs30": site.vs30,
+                "mag": mags,
+                "rrup": np.repeat(
+                    source_to_site.rrup, mags.size // source_to_site.rrup.size
+                ),
+            }
+    )
+    gmm_outputs = oqw.run_gmm(
+        oqw.constants.GMM.A_22, oqw.constants.TectType.ACTIVE_SHALLOW, rupture_df, "PGA"
+    )
+    log_mean = gmm_outputs["PGA_mean"].values.reshape(mags.shape)
+    log_stddev = gmm_outputs["PGA_std_Total"].values.reshape(mags.shape)
     ground_motions = sp.stats.lognorm.rvs(
-        s=stds_flat, scale=np.exp(means_flat), random_state=rng
+        s=log_stddev, scale=np.exp(log_mean), random_state=rng
     )
 
     raw_matrix = _threshold_reduction(ground_motions, plan.counts, thresholds)
-    weighted_hazard = raw_matrix * plan.weights[:, np.newaxis]
-    return weighted_hazard.sum(axis=0)
+    weighted_hazard = raw_matrix * weights[:, np.newaxis]
+    # matrix now has shape (len(sites) * len(ruptures), len(threshold))
+    # but want: (len(sites), len(samples), len(threshold))
+    site_hazard = weighted_hazard.reshape((len(sites), -1, len(thresholds)))
+    return site_hazard
 
 
 class BootstrapResult(NamedTuple):

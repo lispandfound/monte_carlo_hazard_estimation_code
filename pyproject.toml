@@ -10,9 +10,11 @@ authors = [{ name = "Jake Faulkner" }]
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+  "altair<5",
   "cyclopts>=4.5.0",
   "deptry>=0.24.0",
   "folium>=0.20.0",
+  "geocube>=0.7.1",
   "mapclassify>=2.10.0",
   "matplotlib>=3.10.8",
   "nshmdb>=2025.12.1",
@@ -23,6 +25,9 @@ dependencies = [
   "scipy>=1.17.0",
   "seaborn>=0.13.2",
   "source-modelling>=2025.12.1",
+  "standard-imghdr>=3.13.0",
+  "streamlit>=1.19.0",
+  "streamlit-folium>=0.26.1",
   "tqdm>=4.67.1",
 ]
 
