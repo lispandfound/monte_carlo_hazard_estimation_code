@@ -1,22 +1,16 @@
+import functools
+from pathlib import Path
 
-import branca.colormap as cm
 import cyclopts
-import folium
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pooch
-import scipy as sp
 import shapely
-import tqdm
 import xarray as xr
 from geocube.api.core import make_geocube
-from tqdm import tqdm # Optional: for a progress bar
 
-from hazard_estimation import psha, distributed_seismicity
-from hazard_estimation.site import Site
-
-from tqdm.contrib.concurrent import process_map
+from hazard_estimation import psha
 
 app = cyclopts.App()
 
@@ -37,212 +31,74 @@ def generate_source_to_site(source_to_site_df: pd.DataFrame) -> psha.SourceToSit
     return psha.SourceToSite(rrup=source_to_site_df["rrup"])
 
 
-def disaggregate_ruptures(
-    ruptures: pd.DataFrame,
-    source_to_site_df: pd.DataFrame,
-    site: Site,
-    ds_model: gpd.GeoDataFrame,
-    hazard_rate: float,
-) -> pd.Series:
-    joint_df = ruptures.join(source_to_site_df["rrup"])
-    source_model = generate_source_model(joint_df)
-    source_to_site = generate_source_to_site(joint_df)
-
-    def hazard_objective(threshold: float, target: float) -> float:
-        ds_hazard = distributed_seismicity.get_hazard_at(ds_model, site, threshold)
-        hazard = psha.analytical_hazard(source_model, site, source_to_site, threshold)
-        return hazard.sum() + ds_hazard - target
-
-    threshold = sp.optimize.bisect(
-        hazard_objective, 0, 2.0, rtol=1e-3, args=(hazard_rate,)
-    )
-    hazard = psha.analytical_hazard(source_model, site, source_to_site, threshold)
-    ds_hazard = distributed_seismicity.get_hazard_at(ds_model, site, threshold)
-
-    return threshold, ds_hazard / hazard_rate, pd.Series(hazard, index=joint_df.index)
+def hazard_thresholds(composite_hazard: xr.Dataset, rates: np.ndarray) -> xr.DataArray:
+    rupture_hazard = composite_hazard["hazard"].sum("rupture")
+    total_hazard = rupture_hazard + composite_hazard["ds_hazard"]
+    rate_array = xr.DataArray(rates, dims=("rate",), coords=dict(rate=rates))
+    threshold = np.abs(total_hazard - rate_array).idxmin("threshold")
+    return threshold
 
 
-def _disaggregate_single_site_worker(site_info, ruptures, source_to_site_group, ds_model, hazard_rate):
-    """Worker function to process a single site."""
-    name, properties = site_info
-    
-    cur_site = psha.Site(
-        name,
-        lon=properties["geometry"].x,
-        lat=properties["geometry"].y,
-        vs30=properties["vs30"],
-    )
-    
-    # We pass only the specific group for this site to avoid huge data transfers
-    threshold, ds_hazard, site_disagg = disaggregate_ruptures(
-        ruptures, source_to_site_group, cur_site, ds_model, hazard_rate
-    )
-    
-    # Return the results as a tuple to be reassembled
-    return threshold, ds_hazard, site_disagg.values
+def optimal_hazard_sampling_densities(
+    rupture_hazard: xr.DataArray, rate: pd.Series
+) -> xr.DataArray:
+    density = np.sqrt(rate.to_xarray() * rupture_hazard)
+    density /= density.sum("rupture")
+    return density
 
-def disaggregate_all_sites(
-    ruptures, source_to_site_df, sites, ds_model, hazard_rate, n_procs=None
-) -> xr.Dataset:
-    
-    grouped = source_to_site_df.groupby("site")
-    
-    args = [
-        (
-            (name, props), 
-            ruptures, 
-            grouped.get_group(name), 
-            ds_model, 
-            hazard_rate
-        ) 
-        for name, props in sites.iterrows()
-    ]
 
-    results = process_map(
-        _disaggregate_single_site_worker,
-        *zip(*args),
-        max_workers=n_procs,
-        chunksize=1,
-        unit="site",
-        desc="Disaggregating Sites"
+def period_independent_population_and_ds_weighted_sampling(
+    composite_hazard: xr.Dataset,
+    sites: gpd.GeoDataFrame,
+    ruptures: gpd.GeoDataFrame,
+    rates: np.ndarray,
+) -> gpd.GeoDataFrame:
+    thresholds = hazard_thresholds(composite_hazard, rates)
+    rupture_hazard = composite_hazard.hazard.sel(threshold=thresholds)
+    breakpoint()
+    sampling_density = optimal_hazard_sampling_densities(
+        rupture_hazard, ruptures["rate"]
     )
 
-    thresholds, ds_hazards, disagg_list = zip(*results)
-    
-    disagg_matrix = np.vstack(disagg_list)
+    ds_hazard = composite_hazard.ds_hazard.sel(threshold=thresholds)
+    ds_contribution = ds_hazard / (
+        rupture_hazard.sum("rupture") + ds_hazard
+    )  # (period, site)
+    sites["cell_population"] = sites["cell_population"].fillna(0)
+    population_density = sites["cell_population"] / sites["cell_population"].sum()
+    weights = (1 - ds_contribution) * population_density.to_xarray()  # (period, site)
+    weights /= weights.sum()
+    sampling_density = (weights * sampling_density).sum(["period", "site"])
+    ruptures = ruptures.copy()
+    ruptures["kl_density"] = sampling_density.to_series()
+    ruptures["rate_density"] = ruptures["rate"] / ruptures["rate"].sum()
 
-    array = xr.Dataset(
-        data_vars=dict(
-            disagg=(("site", "rupture"), disagg_matrix),
-            threshold=(("site",), list(thresholds)),
-            ds_hazard=(("site",), list(ds_hazards)),
-        ),
-        coords=dict(
-            site=sites.index.values,
-            rupture=ruptures.index.values,
-        ),
-    )
-    return array
+    return ruptures
 
 
-def optimal_proposal_distribution(
-    ruptures: pd.DataFrame, disagg: xr.DataArray
-) -> pd.Series:
-    hazard = disagg.to_dataframe()["disagg"]
-    rate = ruptures["rate"]
-    p = np.sqrt(rate * hazard)
-    p /= p.sum()
-    return p
-
-
-def visualise_distribution(ruptures: gpd.GeoDataFrame, distribution: xr.DataArray):
+@app.command()
+def run_sampling_from_paths(
+    hazard_path: Path,
+    sites_path: Path,
+    ruptures_path: Path,
+    target_rate: float,
+    output_path: Path,
+) -> None:
     """
-    Visualises rupture geometries colored by hazard values in log10 space.
+    Wrapper to load datasets from disk and compute population/DS weighted sampling.
     """
-    # 1. Ensure the GeoDataFrame is in WGS84 for Folium
-    ruptures = ruptures.to_crs(epsg=4326)
+    # 1. Load data
+    sites = gpd.read_parquet(sites_path)
+    sites.index.rename("site", inplace=True)
+    ruptures = gpd.read_parquet(ruptures_path)
+    ruptures.index.rename("rupture", inplace=True)
+    with xr.open_dataset(hazard_path, engine="h5netcdf") as composite_hazard:
+        # 2. Call the core logic function
+        sampled_ruptures = period_independent_population_and_ds_weighted_sampling(
+            composite_hazard, sites, ruptures, target_rate
+        )
 
-    # 2. Align the disagg data to the ruptures GeoDataFrame
-    # We assume 'disagg' shares the same index/order as 'ruptures'
-    df = ruptures.copy()
-    df["p"] = distribution
-    # 3. Apply log-space transformation
-    # We use a small epsilon to avoid log(0) errors
-    epsilon = 1e-12
-    df["log_p"] = np.log10(df["p"] + epsilon)
-    df["log_rate"] = np.log10(df["rate"])
-
-    # Using 'YlOrRd' (Yellow-Orange-Red) for p visualization
-    colormap = cm.LinearColormap(
-        colors=["blue", "cyan", "yellow", "orange", "red"],
-        vmin=-12,
-        vmax=0,
-        caption="P Level (log10 scale)",
-    )
-
-    # 5. Initialize the Map
-    # Center on the centroid of the geometries
-    center = [df.geometry.centroid.y.mean(), df.geometry.centroid.x.mean()]
-    m = folium.Map(location=center, zoom_start=6, tiles="cartodbpositron")
-
-    # 6. Define Style Function
-    def style_fn(feature):
-        log_val = feature["properties"]["log_p"]
-        return {
-            "fillColor": colormap(log_val),
-            "color": colormap(log_val),
-            "weight": 2,
-            "fillOpacity": 0.6,
-        }
-
-    # 7. Add GeoJSON to Map
-    folium.GeoJson(
-        df,
-        style_function=style_fn,
-        tooltip=folium.GeoJsonTooltip(
-            fields=["log_rate", "log_p"],
-            aliases=["Log10 Rate:", "Log10 P:"],
-            localize=True,
-        ),
-    ).add_to(m)
-
-    m.add_child(colormap)
-    return m
-
-
-def visualise_disagg(ruptures: gpd.GeoDataFrame, disagg: xr.DataArray):
-    """
-    Visualises rupture geometries colored by hazard values in log10 space.
-    """
-    # 1. Ensure the GeoDataFrame is in WGS84 for Folium
-    ruptures = ruptures.to_crs(epsg=4326)
-
-    # 2. Align the disagg data to the ruptures GeoDataFrame
-    # We assume 'disagg' shares the same index/order as 'ruptures'
-    df = ruptures.copy()
-    df["hazard"] = disagg.to_dataframe()["disagg"]
-    # 3. Apply log-space transformation
-    # We use a small epsilon to avoid log(0) errors
-    epsilon = 1e-12
-    df["log_hazard"] = np.log10(df["hazard"] + epsilon)
-    df["log_rate"] = np.log10(df["rate"])
-
-    # Using 'YlOrRd' (Yellow-Orange-Red) for hazard visualization
-    colormap = cm.LinearColormap(
-        colors=["blue", "cyan", "yellow", "orange", "red"],
-        vmin=-12,
-        vmax=-3,
-        caption="Hazard Level (log10 scale)",
-    )
-
-    # 5. Initialize the Map
-    # Center on the centroid of the geometries
-    center = [df.geometry.centroid.y.mean(), df.geometry.centroid.x.mean()]
-    m = folium.Map(location=center, zoom_start=6, tiles="cartodbpositron")
-
-    # 6. Define Style Function
-    def style_fn(feature):
-        log_val = feature["properties"]["log_hazard"]
-        return {
-            "fillColor": colormap(log_val),
-            "color": colormap(log_val),
-            "weight": 2,
-            "fillOpacity": 0.6,
-        }
-
-    # 7. Add GeoJSON to Map
-    folium.GeoJson(
-        df,
-        style_function=style_fn,
-        tooltip=folium.GeoJsonTooltip(
-            fields=["log_rate", "log_hazard"],
-            aliases=["Log10 Rate:", "Log10 Hazard:"],
-            localize=True,
-        ),
-    ).add_to(m)
-
-    m.add_child(colormap)
-    return m
+    sampled_ruptures.to_parquet(output_path)
 
 
 NZ_COASTLINE_URL = "https://www.dropbox.com/scl/fi/zkohh794y0s2189t7b1hi/NZ.gmt?rlkey=02011f4morc4toutt9nzojrw1&st=vpz2ri8x&dl=1"
@@ -256,18 +112,17 @@ def get_nz_geodataframe() -> gpd.GeoDataFrame:
     )
 
     gdf = gpd.read_file(file_path).set_crs(4326, allow_override=True).to_crs(2193)
-    gdf['geometry'] = gdf['geometry'].apply(lambda g: shapely.polygonize([g]).geoms[0])
+    gdf["geometry"] = gdf["geometry"].apply(lambda g: shapely.polygonize([g]).geoms[0])
     return gdf
 
 
-
-
-
-def spatial_density(gdf: gpd.GeoDataFrame, geometry_gdf: gpd.GeoDataFrame | None = None):
+def spatial_density(
+    gdf: gpd.GeoDataFrame, geometry_gdf: gpd.GeoDataFrame | None = None
+):
     if geometry_gdf is None:
         geometry_gdf = get_nz_geodataframe()
 
-    geometry = shapely.MultiPolygon(geometry_gdf['geometry'])
+    geometry = shapely.MultiPolygon(geometry_gdf["geometry"])
     voronoi_diagram = gpd.GeoDataFrame(
         dict(geometry=gdf.voronoi_polygons(extend_to=geometry))
     ).clip(geometry)
@@ -281,63 +136,98 @@ def spatial_density(gdf: gpd.GeoDataFrame, geometry_gdf: gpd.GeoDataFrame | None
     gdf["density"] = density
     return gdf
 
-def patch_density_raster(ruptures_df: gpd.GeoDataFrame, column: str, resolution: float = 500.0) -> xr.DataArray:
-    """
-    Iterates over ruptures, rasterizes each, and sums them into a master DataArray.
-    """
-    # 1. Initialize the master grid using the total bounds of all ruptures
-    # We create a 'like' template so all subsequent rasters have the same shape/coords
-    template_gdf = gpd.GeoDataFrame({'dummy': [0]}, geometry=[ruptures_df.unary_union.envelope], crs=ruptures_df.crs)
-    
-    master_grid = make_geocube(
-        vector_data=template_gdf,
-        measurements=['dummy'],
-        resolution=(-resolution, resolution),
-        fill=0.0
-    )
-    
-    # Extract the DataArray and ensure it's float32 to save memory
-    full_density = xr.zeros_like(master_grid['dummy'], dtype=np.float32)
 
-    # 2. Iterate and Accumulate
-    # We use MergeAlg.add to ensure overlapping parts of a MultiPolygon 
-    # within a SINGLE rupture are summed, then we add that to the master.
-    for _, row in tqdm(ruptures_df.iterrows(), total=len(ruptures_df), desc="Rasterizing"):
-        # Convert single row back to a GDF for geocube
-        single_rupture_gdf = gpd.GeoDataFrame([row], crs=ruptures_df.crs)
-        
-        # Rasterize just this one rupture
-        one_rupture_raster = make_geocube(
-            vector_data=single_rupture_gdf,
+def population_density(
+    gdf: gpd.GeoDataFrame,
+    population_blocks: gpd.GeoDataFrame,
+    block_resolution: float = 250**2,
+    population_column: str = "PopEst2023",
+) -> gpd.GeoDataFrame:
+    block_resolved = (
+        gdf.reset_index()
+        .set_geometry("cell")
+        .overlay(population_blocks, how="intersection")
+    )
+    population_in_cells = block_resolved.groupby("site")[population_column].sum()
+    gdf["population_density"] = population_in_cells / population_in_cells.sum()
+    # Some cells have no population blocks in them, we assume no population here.
+    gdf["population_density"] = gdf["population_density"].fillna(0.0)
+    return gdf
+
+
+def _rasterize_batch(
+    batch_df: np.ndarray, column: str, crs: str, master_grid_coords: xr.Dataset
+) -> np.ndarray:
+    """
+    Worker function: Rasterizes a batch of ruptures and sums them locally.
+    Returns a single numpy array to minimize IPC memory overhead.
+    """
+    # Initialize the accumulator for this batch
+    shape = (len(master_grid_coords.y), len(master_grid_coords.x))
+    batch_sum = np.zeros(shape, dtype=np.float32)
+
+    for row in batch_df:
+        # Wrap row in GDF for geocube
+        single_gdf = gpd.GeoDataFrame([row], crs=crs)
+
+        raster = make_geocube(
+            vector_data=single_gdf,
             measurements=[column],
-            like=master_grid, # Force alignment to master grid
+            like=master_grid_coords,
             fill=0.0,
         )
-        
-        # Add this rupture's density to the master accumulator
-        full_density += one_rupture_raster[column]
+        # Add to local batch sum and immediately allow temporary raster to be GC'd
+        batch_sum += raster[column].values.astype(np.float32)
 
-    return full_density
+    return batch_sum
 
 
-def kl_centroid(ruptures: gpd.GeoDataFrame, sites: gpd.GeoDataFrame, disagg: xr.Dataset):
+from geocube.rasterize import rasterize_image
+from rasterio.enums import MergeAlg
+
+
+def patch_density_raster(
+    ruptures_df: gpd.GeoDataFrame,
+    column: str,
+    resolution: float = 500.0,
+) -> xr.DataArray:
+    """
+    Fast, vectorized rasterization that sums overlapping polygons.
+    Avoids iteration and multiprocessing entirely.
+    """
+    # Use functools.partial to bake the merge_alg into the default rasterizer
+    custom_rasterize = functools.partial(rasterize_image, merge_alg=MergeAlg.add)
+
+    master_grid = make_geocube(
+        vector_data=ruptures_df,
+        measurements=[column],
+        resolution=(-resolution, resolution),
+        fill=0.0,
+        rasterize_function=custom_rasterize,
+    )
+
+    return master_grid[column]
+
+
+def kl_centroid(
+    ruptures: gpd.GeoDataFrame,
+    sites: gpd.GeoDataFrame,
+    disagg: xr.Dataset,
+    column: str = "density",
+):
     # Trim stations with high distributed seismicity contribution
     disagg = disagg.sel(site=sites.index)
     disagg = disagg.sel(site=(disagg.ds_hazard < 0.98))
     sites = sites.loc[disagg.site.values]
-    breakpoint()
     ps = [
         optimal_proposal_distribution(ruptures, disagg.disagg.sel(site=site))
         for site in disagg.site.values
     ]
 
     kl_centroid = pd.Series(
-        np.average(ps, axis=0, weights=sites["density"]), index=ruptures.index
+        np.average(ps, axis=0, weights=sites[column]), index=ruptures.index
     )
     return kl_centroid
-
-
-
 
 
 def generate_multinomial_map(gdf, planes_df, weight_col, n_samples, cmap="hot"):
@@ -345,7 +235,7 @@ def generate_multinomial_map(gdf, planes_df, weight_col, n_samples, cmap="hot"):
 
     sampled_gdf = gdf.copy()
     sampled_gdf["sample_count"] = counts
-    sampled_gdf = patch_density(sampled_gdf, planes_df, 'sample_count')
+    sampled_gdf = patch_density(sampled_gdf, planes_df, "sample_count")
     m = sampled_gdf.explore(
         column="sample_count",
         cmap=cmap,
@@ -357,3 +247,7 @@ def generate_multinomial_map(gdf, planes_df, weight_col, n_samples, cmap="hot"):
     )
 
     return m
+
+
+if __name__ == "__main__":
+    app()
