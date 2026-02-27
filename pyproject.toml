@@ -18,6 +18,7 @@ dependencies = [
   "mapclassify>=2.10.0",
   "matplotlib>=3.10.8",
   "nshmdb>=2025.12.1",
+  "numba-stats>=1.11.0",
   "numpy>=2.3.5",
   "oq-wrapper>=2025.12.4",
   "pandas[parquet]>=3.0.0",
