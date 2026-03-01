@@ -6,6 +6,8 @@ from pathlib import Path
 import cyclopts
 import pandas as pd
 
+from hazard_estimation import psha
+
 app = cyclopts.App()
 
 
@@ -30,10 +32,10 @@ class IntensityMeasure(StrEnum):
     """Cumulative Absolute Velocity: The integral of the absolute acceleration over the duration of the motion."""
 
     DS575 = "Ds575"
-    """Significant Duration (5-75%): The time interval over which 5% to 75% of the Arias Intensity is build up."""
+    """Significant Duration (5-75%): The time interval over which 5% to 75% of the Arias Intensity is built up."""
 
     DS595 = "Ds595"
-    """Significant Duration (5-95%): The time interval over which 5% to 95% of the Arias Intensity is build up."""
+    """Significant Duration (5-95%): The time interval over which 5% to 95% of the Arias Intensity is built up."""
 
 
 def ground_motion_model_estimates(
@@ -72,6 +74,7 @@ def run_ground_motion_model(
     im: IntensityMeasure,
     gmm_output_path: Path,
     periods: list[float] | None = None,
+    hazard_threshold: float = 0.3,
 ) -> None:
     """Run the ground motion model for the rupture inputs.
 
@@ -88,6 +91,14 @@ def run_ground_motion_model(
     """
     rupture_df = pd.read_parquet(rupture_df_path)
     gmm_outputs = ground_motion_model_estimates(rupture_df, im, periods)
+    source_model = psha.SourceModel(
+        rates=gmm_outputs["rate"],
+        log_means=gmm_outputs[f"{im}_mean"],
+        log_stds=gmm_outputs[f"{im}_std_Total"],
+    )
+    hazard = psha.analytical_hazard(source_model, hazard_threshold)
+    gmm_outputs["hazard"] = hazard
+
     gmm_outputs.to_parquet(gmm_output_path)
 
 

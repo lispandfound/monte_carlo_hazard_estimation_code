@@ -9,13 +9,14 @@ import numpy as np
 import pandas as pd
 from numpy.random import Generator
 
-from single_site_single_im import psha
-from single_site_single_im.psha import SimulationPlan
+from hazard_estimation import psha
+from hazard_estimation.psha import SimulationPlan
 
 
 class Strategy(typing.Protocol):
     """Generic sampling strategy protocol."""
 
+    name: str
     color: str
 
     def __call__(
@@ -33,6 +34,7 @@ class PoissonStrategy:
     """Colour of sampling strategy in plots."""
     length: int
     """Length of poisson catalogue (in years)."""
+    name: str = "poisson"
 
     def __call__(self, ruptures: pd.DataFrame, rng: Generator) -> SimulationPlan:
         """Create the poisson sampling strategy from a set of ruptures.
@@ -88,6 +90,7 @@ class FixedEffortPoissonStrategy:
     """Colour of sampling strategy in plots."""
     n: int
     """Conditioning number (number of simulations) for Poisson process"""
+    name: str = "fixed_effort"
 
     def __call__(self, ruptures: pd.DataFrame, rng: Generator) -> SimulationPlan:
         """Create the poisson sampling strategy from a set of ruptures.
@@ -145,6 +148,7 @@ class ImportanceSampledStrategy:
     """Conditioning number (number of simulations) for process"""
     title: str
     """Title of sampling strategy."""
+    name: str = "importance_sampled"
 
     def __call__(self, ruptures: pd.DataFrame, rng: Generator) -> SimulationPlan:
         """Create the poisson sampling strategy from a set of ruptures.
@@ -194,6 +198,7 @@ class NaiveStrategy:
     """Colour of sampling strategy in plots."""
     n: int
     """Number of samples per rupture."""
+    name: str = "naive"
 
     def __call__(self, ruptures: pd.DataFrame, rng: Generator) -> SimulationPlan:
         """Create the naive sampling strategy from a set of ruptures.
@@ -238,6 +243,7 @@ class SCECStrategy:
 
     color: str
     """Colour of sampling strategy in plots."""
+    name: str = "scec"
 
     def __call__(self, ruptures: pd.DataFrame, rng: Generator) -> SimulationPlan:
         """Create the SCEC sampling strategy from a set of ruptures.
@@ -286,6 +292,7 @@ class CybershakeStrategy:
 
     color: str
     """Colour of sampling strategy in plots."""
+    name: str = "cybershake"
 
     def __call__(self, ruptures: pd.DataFrame, rng: Generator) -> SimulationPlan:
         """Create the CyberShake NZ sampling strategy from a set of ruptures.
@@ -321,10 +328,104 @@ class CybershakeStrategy:
         str
             Sampling strategy description including total calculated samples.
         """
-        num_samples = np.round(
-            np.clip(27 * ruptures["magnitude"] - 148, 14, 68)
-        ).astype(np.int64)
+        num_samples = int(
+            np.round(np.clip(27 * ruptures["mag"] - 148, 14, 68)).astype(np.int64).sum()
+        )
         return f"Cybershake NZ strategy (N = {num_samples})"
+
+
+@dataclass
+class RateWeightedNaive:
+    """Naive MC with number of samples allocated according to hazard estimates."""
+
+    color: str
+    """Colour of sampling strategy in plots."""
+    n: int
+    """The total number of samples."""
+    name: str = "rate_weighted"
+
+    def __call__(self, ruptures: pd.DataFrame, rng: Generator) -> SimulationPlan:
+        """Calculate the importance weighted naive strategy.
+
+        Parameters
+        ----------
+        ruptures : pd.DataFrame
+            Ruptures to sample.
+        rng : Generator
+            Random number generator to use. Ignored.
+
+        Returns
+        -------
+        pd.DataFrame
+            Strategy sampling weighted towards high hazard source.
+
+        See Also
+        --------
+        psha.optimal_allocation_naive_strategy : The sampling strategy function this calls.
+        """
+        return psha.rate_allocation_naive_strategy(ruptures, self.n)
+
+    def label(self, ruptures: pd.DataFrame) -> str:
+        """Produce a human-readable description of this sampling strategy.
+
+        Parameters
+        ----------
+        ruptures : pd.DataFrame
+            Ruptures to sample.
+
+        Returns
+        -------
+        str
+            Sampling strategy description including total calculated samples.
+        """
+        return f"Rate weighted (N = {self.n})"
+
+
+@dataclass
+class ImportanceWeightedNaive:
+    """Naive MC with number of samples allocated according to hazard estimates."""
+
+    color: str
+    """Colour of sampling strategy in plots."""
+    n: int
+    """The total number of samples."""
+    name: str = "importance_weighted_naive"
+
+    def __call__(self, ruptures: pd.DataFrame, rng: Generator) -> SimulationPlan:
+        """Calculate the importance weighted naive strategy.
+
+        Parameters
+        ----------
+        ruptures : pd.DataFrame
+            Ruptures to sample.
+        rng : Generator
+            Random number generator to use. Ignored.
+
+        Returns
+        -------
+        pd.DataFrame
+            Strategy sampling weighted towards high hazard source.
+
+        See Also
+        --------
+        psha.optimal_allocation_naive_strategy : The sampling strategy function this calls.
+        """
+        return psha.optimal_allocation_naive_strategy(ruptures, self.n)
+
+    def label(self, ruptures: pd.DataFrame) -> str:
+        """Produce a human-readable description of this sampling strategy.
+
+        Parameters
+        ----------
+        ruptures : pd.DataFrame
+            Ruptures to sample.
+
+        Returns
+        -------
+        str
+            Sampling strategy description including total calculated samples.
+        """
+        return f"Importance weighted (N = {self.n})"
 
 
 @dataclass
@@ -365,26 +466,42 @@ def load_strategies(config_path: Path) -> Config:
         match params["type"]:
             case "poisson":
                 strategy = PoissonStrategy(
-                    color=params["color"], length=params["length"]
+                    name=name, color=params["color"], length=params["length"]
                 )
             case "fixed_effort_poisson":
                 strategy = FixedEffortPoissonStrategy(
-                    color=params["color"], n=params["n"]
+                    name=name, color=params["color"], n=params["n"]
                 )
             case "naive":
-                strategy = NaiveStrategy(color=params["color"], n=params["n"])
+                strategy = NaiveStrategy(
+                    name=name, color=params["color"], n=params["n"]
+                )
             case "scec":
-                strategy = SCECStrategy(color=params["color"])
+                strategy = SCECStrategy(name=name, color=params["color"])
             case "cybershake_nz":
-                strategy = CybershakeStrategy(color=params["color"])
+                strategy = CybershakeStrategy(name=name, color=params["color"])
             case "importance_sampled":
                 distribution = pd.read_parquet(params["distribution"])
                 strategy = ImportanceSampledStrategy(
+                    name=name,
                     color=params["color"],
                     distribution=distribution,
                     n=params["n"],
                     title=params["title"],
                 )
+            case "importance_weighted":
+                strategy = ImportanceWeightedNaive(
+                    name=name,
+                    color=params["color"],
+                    n=params["n"],
+                )
+            case "rate_weighted":
+                strategy = RateWeightedNaive(
+                    name=name,
+                    color=params["color"],
+                    n=params["n"],
+                )
+
             case type:
                 raise ValueError(f"Strategy {type} not recognised.")
 

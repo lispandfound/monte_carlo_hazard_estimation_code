@@ -3,26 +3,26 @@ n_resamples = 250
 seed = 1
 
 # --- Importance Sampling (Greens) ---
-[strategies.importance_sampled_100]
-type = 'importance_sampled'
-n = 1600
-distribution = 'data/noisy_hazard_100.parquet'
-color = 'palegreen'                                          # Lighter for lower precision
-title = 'Importance sampling with N = 1600, precision = 100'
+# [strategies.importance_sampled_100]
+# type = 'importance_sampled'
+# n = 1600
+# distribution = 'data/noisy_hazard_100.parquet'
+# color = 'palegreen'                                          # Lighter for lower precision
+# title = 'Importance sampling with N = 1600, precision = 100'
 
-[strategies.importance_sampled_250]
-type = 'importance_sampled'
-n = 1600
-distribution = 'data/noisy_hazard_250.parquet'
-color = 'mediumseagreen'
-title = 'Importance sampling with N = 1600, precision = 250'
+# [strategies.importance_sampled_250]
+# type = 'importance_sampled'
+# n = 1600
+# distribution = 'data/noisy_hazard_250.parquet'
+# color = 'mediumseagreen'
+# title = 'Importance sampling with N = 1600, precision = 250'
 
-[strategies.importance_sampled_1600]
-type = 'importance_sampled'
-n = 1600
-distribution = 'data/noisy_hazard_500.parquet'
-color = 'darkgreen'                                          # Darkest for highest precision
-title = 'Importance sampling with N = 1600, precision = 500'
+# [strategies.importance_sampled_1600]
+# type = 'importance_sampled'
+# n = 1600
+# distribution = 'data/noisy_hazard_500.parquet'
+# color = 'darkgreen'                                          # Darkest for highest precision
+# title = 'Importance sampling with N = 1600, precision = 500'
 
 # --- Multinomial / Fixed Effort (Oranges) ---
 [strategies.multinomial_short]
@@ -36,32 +36,32 @@ n = 6500
 color = "darkorange"
 
 # --- Poisson (Teals/Cyans) ---
-[strategies.poisson_short]
-type = "poisson"
-length = 50000
-color = "turquoise"
+# [strategies.poisson_short]
+# type = "poisson"
+# length = 50000
+# color = "turquoise"
 
-[strategies.poisson_long]
-type = 'poisson'
-length = 200000
-color = "teal"
+# [strategies.poisson_long]
+# type = 'poisson'
+# length = 200000
+# color = "teal"
 
-# --- Naive (Reds) ---
-[strategies.naive_short]
-type = 'naive'
-n = 2
-color = "lightcoral"
+# # --- Naive (Reds) ---
+# [strategies.naive_short]
+# type = 'naive'
+# n = 2
+# color = "lightcoral"
 
-[strategies.naive_long]
-type = 'naive'
-n = 10
-color = "firebrick"
+# [strategies.naive_long]
+# type = 'naive'
+# n = 10
+# color = "firebrick"
 
-# --- External Datasets (Cool Tones) ---
-[strategies.cybershake]
-type = 'cybershake_nz'
-color = 'dodgerblue'
+# # --- External Datasets (Cool Tones) ---
+# [strategies.cybershake]
+# type = 'cybershake_nz'
+# color = 'dodgerblue'
 
-[strategies.scec]
-type = 'scec'
-color = 'rebeccapurple'
+# [strategies.scec]
+# type = 'scec'
+# color = 'rebeccapurple'

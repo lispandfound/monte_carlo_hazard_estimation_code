@@ -1,10 +1,9 @@
 """Tests for the single-site single-im experiment"""
 
-
 import numpy as np
 import pytest
-from single_site_single_im import psha
-from single_site_single_im.psha import SourceModel
+from hazard_estimation import psha
+from hazard_estimation.psha import SourceModel
 
 
 def test_rupture_hazard_monotonically_decreasing() -> None:

@@ -1,14 +1,18 @@
 """Pre-compute rupture dataframes for a given site."""
 
-from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import TypedDict
 
 import cyclopts
+import geopandas as gpd
 import numpy as np
 import pandas as pd
 import tqdm
-from nshmdb.nshmdb import NSHMDB, Rupture
+from nshmdb.nshmdb import NSHMDB, FaultInfo, Rupture
+from tqdm.contrib.concurrent import process_map
+
+from hazard_estimation.site import Site
 
 app = cyclopts.App()
 
@@ -65,16 +69,24 @@ def extract_all_ruptures(db: NSHMDB) -> list[Rupture]:
     return ruptures
 
 
-@dataclass
-class Site:
-    """Site location."""
+def extract_fault_info(db: NSHMDB) -> dict[int, FaultInfo]:
+    """Extract all rupture objects from the nshmdb database.
 
-    lat: float
-    "Latitude of site"
-    lon: float
-    "Longitude of site"
-    vs30: float
-    "Average shear-wave velocity in the top 30m of soil (Vs30)"
+    Parameters
+    ----------
+    db : NSHMDB
+        Database to extract from.
+
+    Returns
+    -------
+    list[Rupture]
+        List of ruptures in the database.
+    """
+    with db.connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""SELECT * FROM fault f""")
+        fault_rows = cursor.fetchall()
+        return {row[0]: FaultInfo(*row) for row in fault_rows}
 
 
 def measure_site_distance(rupture: Rupture, site: Site) -> float:
@@ -101,55 +113,25 @@ class RuptureRow(TypedDict):
 
     rupture_id: int
     mag: float
-    vs30: float
     rrup: float
     area: float
+    rake: float
     rate: float
 
 
-def compile_rupture_dataframe(db: NSHMDB, site: Site) -> pd.DataFrame:
-    """Compile the rupture dataframe for a site.
-
-    Parameters
-    ----------
-    db : NSHMDB
-        The NSHMDB to extract from.
-    site : Site
-        The site to compute for.
-
-    Returns
-    -------
-    pd.DataFrame
-        A dataframe containing rupture id, magnitude, vs30, rrup and
-        rupture rate.
-    """
-    rupture_rows = []
-    ruptures = extract_all_ruptures(db)
-    print(f"Found {len(ruptures)} ruptures to add")
-    for rupture in tqdm.tqdm(ruptures, desc="Compiling dataframe", unit="ruptures"):
-        rrup_metres = measure_site_distance(rupture, site)
-        rrup_kilomtres = rrup_metres / 1000.0
-
-        rupture_rows.append(
-            RuptureRow(
-                rupture_id=rupture.rupture_id,
-                mag=rupture.magnitude,
-                vs30=site.vs30,
-                rrup=rrup_kilomtres,
-                rate=rupture.rate,
-                area=sum(fault.area() for fault in rupture.faults.values()),
-            )
-        )
-
-    return pd.DataFrame(rupture_rows).set_index("rupture_id")
+def compile_rupture_dataframe(nshmdb: NSHMDB) -> pd.DataFrame:
+    ruptures = extract_all_ruptures(nshmdb)
+    fault_rows = extract_fault_info(nshmdb)
+    rows = []
+    for rupture in ruptures:
+        rakes = [fault_rows[fault].rake for fault in rupture.faults]
+        rows.append(RuptureRow())
 
 
 @app.default
 def build_input_rupture_dataframe(
     nshmdb_path: Path,
-    site_lat: float,
-    site_lon: float,
-    site_vs30: float,
+    sites_path: Path,
     output_path: Path,
 ):
     """Build input rupture dataframe for the single site, im, model experiment.
@@ -168,8 +150,7 @@ def build_input_rupture_dataframe(
         Output path (parquet).
     """
     nshmdb = NSHMDB(nshmdb_path)
-    site = Site(lat=site_lat, lon=site_lon, vs30=site_vs30)
-    df = compile_rupture_dataframe(nshmdb, site)
+    df = compile_rupture_dataframe(nshmdb)
     df.to_parquet(output_path)
 
 
