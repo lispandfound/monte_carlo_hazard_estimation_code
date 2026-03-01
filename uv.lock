@@ -957,7 +957,7 @@ requires-dist = [
     { name = "nshmdb", specifier = ">=2025.12.1" },
     { name = "numpy", specifier = ">=2.3.5" },
     { name = "numpydoc", marker = "extra == 'dev'", specifier = ">=1.10.0" },
-    { name = "oq-wrapper", specifier = ">=2025.12.4" },
+    { name = "oq-wrapper", specifier = ">=2025.12.5" },
     { name = "pandas", extras = ["parquet"], specifier = ">=3.0.0" },
     { name = "pandas-stubs", marker = "extra == 'types'", specifier = ">=2.3.3.260113" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=9.0.2" },
@@ -1170,7 +1170,7 @@ numpy = [
 
 [[package]]
 name = "oq-wrapper"
-version = "2025.12.4"
+version = "2025.12.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
@@ -1180,9 +1180,9 @@ dependencies = [
     { name = "scipy" },
     { name = "source-modelling" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/36/a7/6660986605b3e850a569fd874b0d53a2b74a5c70bd21ccf39eb5dc1e38d8/oq_wrapper-2025.12.4.tar.gz", hash = "sha256:83d2f5173325be332f9fdedf52dd3092f254ed1e022b3d2061e3add236e70a7b", size = 27027, upload-time = "2025-12-18T01:14:44.962Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d4/8d/748f1fc683ff0d545ea1dfafefef8dda514f7bb14a6186bb4e5bbd753f6f/oq_wrapper-2025.12.5.tar.gz", hash = "sha256:5fa493cd532c7e0383dc07afbfdd823769f068fcc7357dd86d7751076b065f19", size = 179994, upload-time = "2026-01-23T02:23:35.49Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a9/9b/a4375136e6a61809af603e9f1b8c145475b8bfaa631c17a726fb67630dfb/oq_wrapper-2025.12.4-py3-none-any.whl", hash = "sha256:65436f988ff8b035498478df054cd06af3ac3aacab2ad4cfbbf2ea2549d82767", size = 27392, upload-time = "2025-12-18T01:14:43.83Z" },
+    { url = "https://files.pythonhosted.org/packages/96/82/9d2c938a44991f12fdcbca903f4b80fcc233af779dfd028a08c4eacdd552/oq_wrapper-2025.12.5-py3-none-any.whl", hash = "sha256:6fe11df916fe27c786e8690cbd8c90829a38eac5de2f31d86cc298b1fcee4da4", size = 29150, upload-time = "2026-01-23T02:23:34.12Z" },
 ]
 
 [[package]]
