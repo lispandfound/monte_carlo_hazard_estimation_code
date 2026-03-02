@@ -13,10 +13,13 @@ import pandas as pd
 import scipy as sp
 import tqdm
 import xarray as xr
-from numba_stats import truncnorm
 
 Array1 = np.ndarray[tuple[int,], np.dtype[np.float64]]
+Array2 = np.ndarray[tuple[int, int], np.dtype[np.float64]]
+Array3 = np.ndarray[tuple[int, int, int], np.dtype[np.float64]]
 IArray1 = np.ndarray[tuple[int,], np.dtype[np.int64]]
+IArray2 = np.ndarray[tuple[int, int], np.dtype[np.int64]]
+IArray3 = np.ndarray[tuple[int, int, int], np.dtype[np.int64]]
 HazardMatrix = np.ndarray[tuple[int, int], np.dtype[np.float64]]
 
 app = cyclopts.App()
@@ -46,7 +49,6 @@ def get_leonard_magnitude_params(area: Array1, rake: Array1) -> tuple[Array1, Ar
     # Strike-slip: mu=3.99, sigma=0.26 | Others: mu=4.03, sigma=0.30
     mu_constant = np.where(is_strike_slip, 3.99, 4.03)
     sigma = np.where(is_strike_slip, 0.26, 0.30)
-
     mean_magnitude = np.log10(area) + mu_constant
 
     return mean_magnitude, sigma
@@ -77,8 +79,8 @@ def analytical_rupture_sample(
         ruptures["area"].values / 1e6, ruptures["rake"]
     )
     z = np.linspace(z_lower, z_upper, num=num)
-    #           (N_r, N_z)   +            (Nr, Nz) * (Nr, Nz)
     magnitude = mean_magnitude[:, None] + z[None, :] * sigma[:, None]
+
     return xr.DataArray(
         magnitude,
         dims=("rupture", "z"),
@@ -113,14 +115,12 @@ def ground_motion_inputs(
             vs30=vs30,
         )
     )
-
     return dset.stack(realisation=dset.dims)
 
 
 def run_ground_motion_model(
     ground_motion_inputs: xr.Dataset, intensity_measure: str, period: float
 ) -> xr.Dataset:
-    # Final flat array for vectorised gmm:
     gmm_inputs = ground_motion_inputs.to_dataframe()
     gmm_outputs = oqw.run_gmm(
         oqw.constants.GMM.A_22,
@@ -133,24 +133,22 @@ def run_ground_motion_model(
     im_std = next(
         column for column in gmm_outputs.columns if column.endswith("_std_Total")
     )
-    output_ds = xr.Dataset(
+    return xr.Dataset(
         data_vars={
             "log_mean": (ground_motion_inputs.dims, gmm_outputs[im_mean].values),
             "log_stddev": (ground_motion_inputs.dims, gmm_outputs[im_std].values),
         },
         coords=ground_motion_inputs.coords,
     )
-    return output_ds
 
 
 @numba.njit(cache=True)
 def _threshold_reduction(
-    ground_motions: np.ndarray,
+    ground_motions: Array1,
     n_sites: int,
-    samples_per_rupture: np.ndarray,
-    thresholds: np.ndarray,
-) -> np.ndarray:
-    # Initialize with the number of ruptures (len(samples))
+    samples_per_rupture: IArray1,
+    thresholds: Array1,
+) -> IArray3:
     n_ruptures = len(samples_per_rupture)
     occupancy_matrix = np.zeros((n_sites, n_ruptures, len(thresholds)), dtype=np.int64)
 
@@ -168,43 +166,25 @@ def _threshold_reduction(
 
 def monte_carlo_threshold_occupancy(
     ground_motion_observations: xr.Dataset,
-    thresholds: npt.NDArray[np.floating],
+    thresholds: Array1,
     rng: np.random.Generator,
-) -> xr.Dataset:
-    """Compute rupture hazard for an array of thresholds with monte-carlo sampling.
-
-    Parameters
-    ----------
-    ground_motions : pd.DataFrame
-        Sampled ground motions.
-    thresholds : npt.NDArray[np.floating]
-        1D array of intensity measure thresholds.
-
-    Returns
-    -------
-    npt.NDArray[np.floating]
-        2D array of shape (n_sources, n_thresholds) containing the exceedance rates.
-    """
-
+) -> xr.DataArray:
     sampled_ground_motions = xr.apply_ufunc(
         rng.normal,
         ground_motion_observations.log_mean,
         ground_motion_observations.log_stddev,
-    )
-    sampled_ground_motions = sampled_ground_motions.sortby(["site", "rupture"])
+    ).sortby(["site", "rupture"])
+
     sites = np.unique(sampled_ground_motions.site.values)
     ruptures, sample_count = np.unique(
         sampled_ground_motions.rupture.values, return_counts=True
     )
-    # sample count over counts by the number of sites.
     sample_count //= len(sites)
-    values = sampled_ground_motions.values
+
     occupancy_count = _threshold_reduction(
-        values,
-        len(sites),
-        sample_count,
-        np.log(thresholds),
+        sampled_ground_motions.values, len(sites), sample_count, np.log(thresholds)
     )
+
     occupancy_count_da = xr.DataArray(
         occupancy_count,
         dims=("site", "rupture", "threshold"),
@@ -213,31 +193,19 @@ def monte_carlo_threshold_occupancy(
     sample_count_da = xr.DataArray(
         sample_count, dims="rupture", coords=dict(rupture=ruptures)
     )
-    poe = occupancy_count_da / sample_count_da
 
-    return poe
+    return occupancy_count_da / sample_count_da
 
 
-@numba.njit(parallel=True)
+@numba.njit(parallel=True, cache=True)
 def _analytical_threshold_reduction(
-    log_mean: np.ndarray, log_stddev: np.ndarray, z: np.ndarray, threshold: np.ndarray
+    log_mean: np.ndarray,
+    log_stddev: np.ndarray,
+    weights: np.ndarray,
+    threshold: np.ndarray,
 ) -> np.ndarray:
-
     (n_site, n_rupture, nz) = log_mean.shape
     nt = len(threshold)
-
-    phi_z = truncnorm.pdf(z, float(STDDEV_LOWER), float(STDDEV_UPPER), 0.0, 1.0)
-
-    weights = np.zeros(nz, dtype=np.float64)
-    if nz > 1:
-        weights[0] = 0.5 * (z[1] - z[0])
-        weights[-1] = 0.5 * (z[-1] - z[-2])
-        for m in range(1, nz - 1):
-            weights[m] = 0.5 * (z[m + 1] - z[m - 1])
-    elif nz == 1:
-        weights[0] = 1.0
-
-    phi_weights = phi_z * weights
 
     poe = np.zeros((n_site, n_rupture, nt), dtype=log_mean.dtype)
     sqrt2 = np.sqrt(2)
@@ -247,44 +215,38 @@ def _analytical_threshold_reduction(
             for k in range(nt):
                 t = threshold[k]
                 integral_sum = 0.0
-
                 for l in range(nz):
                     mu = log_mean[i, j, l]
                     sigma = log_stddev[i, j, l]
-
                     exceedance_prob = 0.5 * math.erfc((t - mu) / (sigma * sqrt2))
-
-                    integral_sum += exceedance_prob * phi_weights[l]
-
+                    integral_sum += exceedance_prob * weights[l]
                 poe[i, j, k] = integral_sum
 
     return poe
 
 
+def trapezium_integration_weights(
+    z: Array1,
+) -> Array1:
+    phi_z = sp.stats.truncnorm.pdf(
+        z, float(STDDEV_LOWER), float(STDDEV_UPPER), loc=0.0, scale=1.0
+    )
+    dz = z[1] - z[0]
+    weights = phi_z * dz
+    weights[[0, -1]] /= 2
+    return weights
+
+
 def analytical_threshold_occupancy(
-    ground_motion_observations: xr.Dataset, thresholds: npt.NDArray[np.floating]
+    ground_motion_observations: xr.Dataset, thresholds: Array1, weights: Array1
 ) -> xr.DataArray:
-    """Compute rupture hazard for an array of thresholds with z-score integration.
-
-    Parameters
-    ----------
-    ground_motions : pd.DataFrame
-        Sampled ground motions.
-    thresholds : npt.NDArray[np.floating]
-        1D array of intensity measure thresholds.
-
-    Returns
-    -------
-    npt.NDArray[np.floating]
-        2D array of shape (n_sources, n_thresholds) containing the exceedance rates.
-    """
     cond_prob = _analytical_threshold_reduction(
         ground_motion_observations.log_mean.values,
         ground_motion_observations.log_stddev.values,
-        ground_motion_observations.z.values,
+        weights,
         np.log(thresholds),
     )
-    cond_prob_da = xr.DataArray(
+    return xr.DataArray(
         cond_prob,
         dims=("site", "rupture", "threshold"),
         coords=dict(
@@ -293,7 +255,76 @@ def analytical_threshold_occupancy(
             threshold=thresholds,
         ),
     )
-    return cond_prob_da
+
+
+def aggregate_analytical_hazard(
+    gmm_outputs: xr.Dataset, rates: xr.DataArray, thresholds: Array1
+) -> xr.DataArray:
+    """Multiplies calculated occupancy probability by the rupture rate."""
+    weights = trapezium_integration_weights(gmm_outputs.z.values)
+    cond_prob = analytical_threshold_occupancy(gmm_outputs, thresholds, weights)
+    return cond_prob * rates
+
+
+def aggregate_monte_carlo_hazard(
+    gmm_outputs: xr.Dataset,
+    weights: xr.DataArray,
+    thresholds: Array1,
+    rng: np.random.Generator,
+) -> xr.DataArray:
+    """Multiplies simulated occupancy probability by calculated weights."""
+    cond_prob = monte_carlo_threshold_occupancy(gmm_outputs, thresholds, rng)
+    return cond_prob * weights
+
+
+def calculate_analytical_hazard(
+    ruptures: pd.DataFrame,
+    source_to_site: pd.DataFrame,
+    sites: pd.DataFrame,
+    periods: Array1,
+    thresholds: Array1,
+    n: int,
+) -> xr.DataArray:
+    """End-to-end Python API for analytical hazard."""
+    realisations = analytical_rupture_sample(ruptures, STDDEV_LOWER, STDDEV_UPPER, n)
+    rrup = rupture_distances(source_to_site).sel(site=sites.index.values)
+    gmm_inputs = ground_motion_inputs(realisations, rrup, sites)
+    rates = ruptures["rate"].to_xarray()
+
+    gmm_hazards = []
+    for period in tqdm.tqdm(periods, unit="period"):
+        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period).unstack()
+        hazard = aggregate_analytical_hazard(gmm_outputs, rates, thresholds)
+        gmm_hazards.append(hazard)
+
+    return xr.concat(gmm_hazards, dim=pd.Index(periods, name="period"))
+
+
+def calculate_monte_carlo_hazard(
+    ruptures: pd.DataFrame,
+    source_to_site: pd.DataFrame,
+    sites: pd.DataFrame,
+    periods: Array1,
+    thresholds: Array1,
+    n: int,
+    column: str,
+    seed: int | None,
+) -> xr.DataArray:
+    """End-to-end Python API for monte carlo hazard."""
+    realisations = monte_carlo_sample(ruptures, n, STDDEV_LOWER, STDDEV_UPPER, column)
+    rrup = rupture_distances(source_to_site).sel(site=sites.index.values)
+    gmm_inputs = ground_motion_inputs(realisations, rrup, sites)
+
+    weights = (ruptures["rate"] / (ruptures[column] * n)).to_xarray()
+    rng = np.random.default_rng(seed=seed)
+
+    hazards = []
+    for period in tqdm.tqdm(periods, unit="period"):
+        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period)
+        hazard = aggregate_monte_carlo_hazard(gmm_outputs, weights, thresholds, rng)
+        hazards.append(hazard)
+
+    return xr.concat(hazards, dim=pd.Index(periods, name="period"))
 
 
 DEFAULT_PERIODS = [
@@ -319,7 +350,6 @@ THRESHOLDS = np.geomspace(0.1, 2.0, num=30)
 def load_hazard_inputs(
     ruptures_path: Path, source_to_site_path: Path, sites_path: Path
 ):
-    """Handles loading and basic indexing for input dataframes."""
     ruptures = pd.read_parquet(ruptures_path).rename_axis("rupture")
     source_to_site = pd.read_parquet(source_to_site_path).rename_axis("rupture")
     sites = gpd.read_parquet(sites_path).rename_axis("site")
@@ -329,9 +359,7 @@ def load_hazard_inputs(
 def compute_distributed_hazard(
     path: Path, sites: gpd.GeoDataFrame, target_thresholds: np.ndarray
 ):
-    """Processes distributed seismicity via nearest-neighbour spatial join."""
     ds_model = gpd.read_parquet(path).to_crs(sites.crs).query('rlz == "mean"')
-
     matched_sites = sites.sjoin_nearest(ds_model)
     ds_hazard = (
         matched_sites.reset_index()
@@ -339,44 +367,6 @@ def compute_distributed_hazard(
         .to_xarray()
     )
     return ds_hazard.interp(threshold=target_thresholds)
-
-
-def run_analytical_hazard(
-    rates,
-    realisations,
-    rrup,
-    sites,
-    periods,
-    thresholds,
-):
-    gmm_inputs = ground_motion_inputs(realisations, rrup, sites)
-    gmm_hazards = []
-
-    for period in tqdm.tqdm(periods, unit="period"):
-        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period)
-        gmm_outputs = gmm_outputs.unstack()
-        cond_prob = analytical_threshold_occupancy(gmm_outputs, thresholds)
-        hazard = cond_prob * rates.to_xarray()
-        gmm_hazards.append(hazard)
-
-    return xr.concat(gmm_hazards, dim=pd.Index(periods, name="period"))
-
-
-def run_monte_carlo_simulation(
-    realisations, rrup, sites, ruptures, n, column, periods, thresholds, seed
-):
-    """Core simulation loop for GMM hazard calculation."""
-    gmm_inputs = ground_motion_inputs(realisations, rrup, sites)
-    rng = np.random.default_rng(seed=seed)
-    weights = (ruptures["rate"] / (ruptures[column] * n)).to_xarray()
-
-    hazards = []
-    for period in tqdm.tqdm(periods, unit="period"):
-        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period)
-        cond_prob = monte_carlo_threshold_occupancy(gmm_outputs, thresholds, rng)
-        hazards.append(cond_prob * weights)
-
-    return xr.concat(hazards, dim=pd.Index(periods, name="period"))
 
 
 @app.command()
@@ -393,21 +383,19 @@ def hazard(
     ruptures, source_to_site, sites = load_hazard_inputs(
         ruptures_path, source_to_site_path, sites_path
     )
-    periods = periods or DEFAULT_PERIODS
-
-    realisations = analytical_rupture_sample(ruptures, STDDEV_LOWER, STDDEV_UPPER, n)
-    rrup = rupture_distances(source_to_site).sel(site=list(sites.index.values))
+    periods_arr = np.array(periods or DEFAULT_PERIODS)
     thresholds_arr = np.asarray(thresholds) if thresholds else THRESHOLDS
-    rupture_hazard = run_analytical_hazard(
-        ruptures["rate"], realisations, rrup, sites, periods, thresholds_arr
+
+    rupture_hazard = calculate_analytical_hazard(
+        ruptures, source_to_site, sites, periods_arr, thresholds_arr, n
     )
 
     ds_hazard = compute_distributed_hazard(
         distributed_seismicity_path, sites, rupture_hazard.threshold.values
     )
-
-    total_hazard = xr.Dataset(dict(ds_hazard=ds_hazard, hazard=rupture_hazard))
-    total_hazard.to_netcdf(gmm_hazard_path, engine="h5netcdf")
+    xr.Dataset(dict(ds_hazard=ds_hazard, hazard=rupture_hazard)).to_netcdf(
+        gmm_hazard_path, engine="h5netcdf"
+    )
 
 
 @app.command()
@@ -423,27 +411,22 @@ def monte_carlo_hazard(
     seed: int | None = None,
     column: str = "kl_density",
 ) -> None:
-    # 1. Setup Data
     ruptures, source_to_site, sites = load_hazard_inputs(
         ruptures_path, source_to_site_path, sites_path
     )
-    periods = periods or DEFAULT_PERIODS
+    periods_arr = np.array(periods or DEFAULT_PERIODS)
     thresholds_arr = np.asarray(thresholds) if thresholds else THRESHOLDS
 
-    rrup = rupture_distances(source_to_site).sel(site=list(sites.index.values))
-
-    realisations = monte_carlo_sample(ruptures, n, STDDEV_LOWER, STDDEV_UPPER, column)
-
-    rupture_hazard = run_monte_carlo_simulation(
-        realisations, rrup, sites, ruptures, n, column, periods, thresholds_arr, seed
+    rupture_hazard = calculate_monte_carlo_hazard(
+        ruptures, source_to_site, sites, periods_arr, thresholds_arr, n, column, seed
     )
 
     ds_hazard = compute_distributed_hazard(
         distributed_seismicity_path, sites, rupture_hazard.threshold.values
     )
-
-    total_hazard = xr.Dataset(dict(ds_hazard=ds_hazard, hazard=rupture_hazard))
-    total_hazard.to_netcdf(gmm_hazard_path, engine="h5netcdf")
+    xr.Dataset(dict(ds_hazard=ds_hazard, hazard=rupture_hazard)).to_netcdf(
+        gmm_hazard_path, engine="h5netcdf"
+    )
 
 
 if __name__ == "__main__":
