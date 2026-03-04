@@ -8,8 +8,9 @@ from hazard_estimation.psha import (
     aggregate_analytical_hazard,
     analytical_threshold_occupancy,
     monte_carlo_threshold_occupancy,
+    monte_carlo_sample
 )
-from hypothesis import given, settings
+from hypothesis import given, settings, Phase
 from hypothesis import strategies as st
 from hypothesis.extra import numpy as hpy
 
@@ -31,7 +32,7 @@ def thresholds_strategy(draw):
 
 
 @st.composite
-def rupture_dataframe_strategy(draw, n_ruptures) -> pd.DataFrame:
+def rupture_dataframe_strategy(draw, n_ruptures, n_counts: int) -> pd.DataFrame:
     log_area = draw(hpy.arrays(np.float64, (n_ruptures,), elements=st.floats(2.0, 3.5)))
     area = 10**log_area
     rake = draw(
@@ -44,8 +45,9 @@ def rupture_dataframe_strategy(draw, n_ruptures) -> pd.DataFrame:
             elements=st.floats(min_value=0.001, max_value=0.5),
         )
     )
+    counts = draw(hpy.arrays(np.int64, (n_ruptures,), elements=st.integers(min_value=1, max_value=n_counts)))
 
-    return pd.DataFrame({"area": area, "rake": rake, "rates": rates})
+    return pd.DataFrame({"area": area, "rake": rake, "rate": rates, 'counts': counts}).rename_axis('rupture')
 
 
 @st.composite
@@ -103,7 +105,42 @@ def rates_strategy(draw, n_ruptures=3):
     )
 
 
-# Checks that naive
+def bernoulli_poe_estimates(mc_sample: xr.Dataset, p: float) -> xr.DataArray:
+    ruptures, value_counts = np.unique(mc_sample.rupture.values, return_counts=True)
+    p_est = np.random.binomial(value_counts, p) / value_counts
+    return xr.DataArray(
+        p_est,
+        dims=('rupture',),
+        coords=dict(
+            rupture=ruptures
+        )
+    )
+
+
+@given(
+    # between 1 and 1000
+    rupture_df=rupture_dataframe_strategy(n_ruptures=10, n_counts=100),
+)
+@settings(phases=[Phase.generate])
+def test_monte_carlo_importance_sample_weights(rupture_df: pd.DataFrame):
+    mc_sample = monte_carlo_sample(rupture_df, rupture_df['counts'], STDDEV_LOWER, STDDEV_UPPER)
+    p = 0.5
+    poe = bernoulli_poe_estimates(mc_sample.magnitudes, p=p) # generate a synthetic poe calculation based on a Bernoulli trial to isolate just IS weighting
+    hazard = (rupture_df['rate'] * poe).sum()
+    theoretical_hazard = (rupture_df['rate'] * p).to_xarray().sum()
+
+    var = (rupture_df['rate'] ** 2 * p * (1 - p) / rupture_df['counts']).sum()
+    se = np.sqrt(var)
+    tolerance = 4 * se
+
+    # Due to floating point error, or just dumb luck we set a minimum tolerance of 10^-5
+    tolerance = np.maximum(tolerance, 1e-5)
+    meets_tolerance = np.abs(hazard - theoretical_hazard) < tolerance
+    assert np.all(meets_tolerance), (
+        f"MC converged to {hazard} but expected {theoretical_hazard}"
+    )
+   
+
 @given(
     gmm_ds=analytical_gmm_strategy(
         n_sites=1,
@@ -138,7 +175,7 @@ def test_monte_carlo_is_unbiased_estimator(gmm_ds, thresholds):
         coords=dict(site=gmm_ds.site, rupture=ruptures),
     ).stack(sample=("site", "rupture"))
 
-    mc_poe = monte_carlo_threshold_occupancy(mc_gmm_ds, thresholds, rng)
+    mc_poe = monte_carlo_threshold_occupancy(mc_gmm_ds, thresholds, rng) / n_repeats
     theoretical_variance = analytical_poe * (1 - analytical_poe)
     # CLT provides a standard error on the mean estimate that we can use to check tolerance
     standard_error = np.sqrt(theoretical_variance / n_repeats)

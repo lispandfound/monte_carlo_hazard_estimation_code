@@ -55,17 +55,22 @@ def get_leonard_magnitude_params(area: Array1, rake: Array1) -> tuple[Array1, Ar
 
 
 def monte_carlo_sample(
-    ruptures: pd.DataFrame, n: int, z_lower: float, z_upper: float, column: str
-) -> xr.DataArray:
-    sample = ruptures.sample(n, replace=True, weights=column)
+    ruptures: pd.DataFrame, counts: pd.Series, z_lower: float, z_upper: float, 
+) -> xr.Dataset:
+    sample = ruptures.loc[np.repeat(ruptures.index, counts)]
+    rates = ruptures['rate'].loc[sample.index]
     mean_magnitude, sigma = get_leonard_magnitude_params(
         sample["area"] / 1e6, sample["rake"]
     )
     magnitudes = sp.stats.truncnorm.rvs(
         z_lower, z_upper, loc=mean_magnitude, scale=sigma
     )
-    return xr.DataArray(
-        magnitudes, dims=("rupture",), coords=dict(rupture=sample.index.values)
+    return xr.Dataset(
+        dict(
+             magnitudes=("rupture", magnitudes),
+             rates=('rupture', rates)
+        ),
+        coords=dict(rupture=sample.index.values)
     )
 
 
@@ -311,17 +316,16 @@ def calculate_monte_carlo_hazard(
     seed: int | None,
 ) -> xr.DataArray:
     """End-to-end Python API for monte carlo hazard."""
-    realisations = monte_carlo_sample(ruptures, n, STDDEV_LOWER, STDDEV_UPPER, column)
+    realisations = monte_carlo_sample(ruptures, ruptures['count'], STDDEV_LOWER, STDDEV_UPPER)
     rrup = rupture_distances(source_to_site).sel(site=sites.index.values)
-    gmm_inputs = ground_motion_inputs(realisations, rrup, sites)
+    gmm_inputs = ground_motion_inputs(realisations.magnitudes, rrup, sites)
 
-    weights = (ruptures["rate"] / (ruptures[column] * n)).to_xarray()
     rng = np.random.default_rng(seed=seed)
 
     hazards = []
     for period in tqdm.tqdm(periods, unit="period"):
         gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period)
-        hazard = aggregate_monte_carlo_hazard(gmm_outputs, weights, thresholds, rng)
+        hazard = aggregate_monte_carlo_hazard(gmm_outputs, realisations.weights.drop_duplicates(), thresholds, rng)
         hazards.append(hazard)
 
     return xr.concat(hazards, dim=pd.Index(periods, name="period"))

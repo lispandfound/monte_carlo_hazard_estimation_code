@@ -1,14 +1,21 @@
+import bisect
 import functools
+import itertools
 from pathlib import Path
 
 import cyclopts
+import folium
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pooch
+import scipy as sp
+import seaborn as sns
 import shapely
+import tqdm
 import xarray as xr
 from geocube.api.core import make_geocube
+from matplotlib import pyplot as plt
 
 from hazard_estimation import psha
 
@@ -31,18 +38,20 @@ def generate_source_to_site(source_to_site_df: pd.DataFrame) -> psha.SourceToSit
     return psha.SourceToSite(rrup=source_to_site_df["rrup"])
 
 
-def hazard_thresholds(composite_hazard: xr.Dataset, rates: np.ndarray) -> xr.DataArray:
+def hazard_thresholds(composite_hazard: xr.Dataset, target_rate: float) -> xr.DataArray:
     rupture_hazard = composite_hazard["hazard"].sum("rupture")
     total_hazard = rupture_hazard + composite_hazard["ds_hazard"]
-    rate_array = xr.DataArray(rates, dims=("rate",), coords=dict(rate=rates))
-    threshold = np.abs(total_hazard - rate_array).idxmin("threshold")
+    threshold = np.abs(total_hazard - target_rate).idxmin("threshold")
     return threshold
 
 
 def optimal_hazard_sampling_densities(
-    rupture_hazard: xr.DataArray, rate: pd.Series
+    rupture_hazard: xr.DataArray, rate: pd.Series, random: bool
 ) -> xr.DataArray:
-    density = np.sqrt(rate.to_xarray() * rupture_hazard)
+    if random:
+        density = np.sqrt(rate.to_xarray() * rupture_hazard)
+    else:
+        density = np.sqrt(rate.to_xarray() * rupture_hazard - rupture_hazard**2)
     density /= density.sum("rupture")
     return density
 
@@ -51,16 +60,21 @@ def period_independent_population_and_ds_weighted_sampling(
     composite_hazard: xr.Dataset,
     sites: gpd.GeoDataFrame,
     ruptures: gpd.GeoDataFrame,
-    rates: np.ndarray,
-) -> gpd.GeoDataFrame:
+    rates: float,
+    periods: np.ndarray,
+    random: bool = False,
+) -> xr.DataArray:
     thresholds = hazard_thresholds(composite_hazard, rates)
-    rupture_hazard = composite_hazard.hazard.sel(threshold=thresholds)
-    breakpoint()
+    rupture_hazard = composite_hazard.hazard.sel(threshold=thresholds).sel(
+        period=periods, method="nearest"
+    )
     sampling_density = optimal_hazard_sampling_densities(
-        rupture_hazard, ruptures["rate"]
+        rupture_hazard, ruptures["rate"], random=random
     )
 
-    ds_hazard = composite_hazard.ds_hazard.sel(threshold=thresholds)
+    ds_hazard = composite_hazard.ds_hazard.sel(threshold=thresholds).sel(
+        period=periods, method="nearest"
+    )
     ds_contribution = ds_hazard / (
         rupture_hazard.sum("rupture") + ds_hazard
     )  # (period, site)
@@ -69,11 +83,7 @@ def period_independent_population_and_ds_weighted_sampling(
     weights = (1 - ds_contribution) * population_density.to_xarray()  # (period, site)
     weights /= weights.sum()
     sampling_density = (weights * sampling_density).sum(["period", "site"])
-    ruptures = ruptures.copy()
-    ruptures["kl_density"] = sampling_density.to_series()
-    ruptures["rate_density"] = ruptures["rate"] / ruptures["rate"].sum()
-
-    return ruptures
+    return sampling_density
 
 
 @app.command()
@@ -81,8 +91,10 @@ def run_sampling_from_paths(
     hazard_path: Path,
     sites_path: Path,
     ruptures_path: Path,
-    target_rate: float,
-    output_path: Path,
+    target_probs: list[float],
+    output: Path | None = None,
+    periods: list[float] | None = None,
+    random: bool = False,
 ) -> None:
     """
     Wrapper to load datasets from disk and compute population/DS weighted sampling.
@@ -92,13 +104,369 @@ def run_sampling_from_paths(
     sites.index.rename("site", inplace=True)
     ruptures = gpd.read_parquet(ruptures_path)
     ruptures.index.rename("rupture", inplace=True)
+    target_rates = -np.log(1 - np.array(target_probs)) / 50
     with xr.open_dataset(hazard_path, engine="h5netcdf") as composite_hazard:
-        # 2. Call the core logic function
-        sampled_ruptures = period_independent_population_and_ds_weighted_sampling(
-            composite_hazard, sites, ruptures, target_rate
+        periods_arr = np.array(periods) if periods else composite_hazard.period.values
+        density = np.zeros((len(target_rates), len(periods_arr) + 1, len(ruptures)))
+        sampling_periods = [periods_arr] + [
+            periods_arr[[i]] for i in range(periods_arr.size)
+        ]
+        density_da = xr.DataArray(
+            density,
+            dims=("rate", "period", "rupture"),
+            coords=dict(
+                period=[p.mean() for p in sampling_periods],
+                rate=target_rates,
+                rupture=ruptures.index,
+            ),
         )
+        pairs = list(
+            itertools.product(range(len(target_rates)), range(len(sampling_periods)))
+        )
+        for i, j in tqdm.tqdm(pairs, unit="pair"):
+            rate = target_rates[i]
+            array = period_independent_population_and_ds_weighted_sampling(
+                composite_hazard,
+                sites,
+                ruptures,
+                rate,
+                sampling_periods[j],
+                random=random,
+            )
+            density_da[i][j] = array
 
-    sampled_ruptures.to_parquet(output_path)
+    density_da.to_netcdf(output, engine="h5netcdf")
+
+
+def random_sampling_variance(
+    sampling_densities: xr.DataArray, rupture_rates: xr.DataArray, hazard: xr.DataArray
+):
+    total_hazard = hazard.sum().item()
+    np.sqrt(rupture_rates * hazard).sum()
+
+
+@app.command()
+def evaluate_sampling_strategy(
+    sampling_densities_path: Path,
+    hazard_path: Path,
+    output_path: Path,
+    random: bool = False,
+):
+    with (
+        xr.open_dataset(hazard_path, engine="h5netcdf") as composite_hazard,
+        xr.open_dataset(
+            sampling_densities_path, engine="h5netcdf"
+        ) as sampling_densities,
+    ):
+        total_hazard = composite_hazard.sum("rupture")
+        for site in sampling_densities.site:
+            m = range(len(sampling_densities.period))
+            n = range(len(sampling_densities.rate))
+            bias = np.zeros(sampling_densities.shape, dtype=float)
+            variance = np.zeros_like(bias)
+            ess = np.zeros_like(bias)
+            error_dset = xr.Dataset(
+                dict(
+                    bias=(("rate", "period", "threshold"), bias),
+                    variance=(("rate", "period", "threshold"), variance),
+                    ess=(("rate", "period", "threshold"), ess),
+                ),
+                coords=dict(
+                    rate=sampling_densities.rate, period=sampling_densities.period
+                ),
+            )
+            total_hazard = composite_hazard.sel(site=site).sum("rupture")
+            for i, j in itertools.product(*error_dset.bias.shape):
+                if random:
+                    variance = random_sampling_variance
+
+
+def plot_kl_divergence_period_heatmap(da: xr.DataArray):
+    Q = da.isel(period=0)
+
+    P = da.isel(period=slice(1, None))
+
+    epsilon = 1e-12
+    kl_div = (P * np.log((P + epsilon) / (Q + epsilon))).sum(dim="rupture")
+
+    kl_div = kl_div.sortby("period")
+
+    df_plot = kl_div.to_pandas().T
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    xticklabels = [f"{r:.2e}" for r in df_plot.columns]
+    yticklabels = [f"{p:.2f}" for p in df_plot.index]
+
+    sns.heatmap(
+        df_plot,
+        annot=True,
+        fmt=".3f",
+        cmap="viridis",
+        cbar_kws={"label": "KL Divergence (bits)"},
+        yticklabels=yticklabels,
+        xticklabels=xticklabels,
+        ax=ax,
+    )
+
+    ax.set_title(
+        "Sensitivity: KL Divergence of Period-Specific Optimal vs. Mean Case",
+        fontsize=14,
+    )
+    ax.set_xlabel(r"Target Hazard Rate ($\lambda$)", fontsize=12)
+    ax.set_ylabel("Spectral Period (s)", fontsize=12)
+
+    fig.tight_layout()
+    return fig
+
+
+def plot_pairwise_rate_kl_divergence(da: xr.DataArray):
+    # 1. Isolate the mean period case (isel=0)
+    # Shape is (rate, rupture)
+    mean_period_da = da.isel(period=0)
+
+    # 2. Create two versions with different dimension names for broadcasting
+    # This lets us compute every pair (rate_p, rate_q)
+    P = mean_period_da.rename({"rate": "rate_p"})
+    Q = mean_period_da.rename({"rate": "rate_q"})
+
+    # 3. Vectorized Pairwise KL Divergence
+    # Resulting shape: (rate_p, rate_q)
+    epsilon = 1e-12
+    # KL(P || Q) = sum( P * log(P/Q) )
+    pairwise_kl = (P * np.log((P + epsilon) / (Q + epsilon))).sum(dim="rupture")
+
+    # 4. Sort both axes so the heatmap is logically ordered by rate
+    pairwise_kl = pairwise_kl.sortby("rate_p").sortby("rate_q")
+
+    # 5. Convert to pandas for Seaborn
+    df_plot = pairwise_kl.to_pandas()
+
+    # 6. Plotting
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # Format labels as scientific notation for the rates
+    labels = [f"{r:.2e}" for r in df_plot.index]
+
+    sns.heatmap(
+        df_plot,
+        annot=True,
+        fmt=".4f",
+        cmap="rocket",
+        xticklabels=labels,
+        yticklabels=labels,
+        cbar_kws={"label": "KL Divergence $D_{KL}(Rate_Y || Rate_X)$"},
+        ax=ax,
+    )
+
+    ax.set_title(
+        "Pairwise Rate Sensitivity: $D_{KL}$ between Target Hazard Rates\n(at Mean Period Sampling Density)",
+        fontsize=14,
+    )
+    ax.set_xlabel(r"Reference Rate $Q$ ($\lambda$)", fontsize=12)
+    ax.set_ylabel(r"Target Rate $P$ ($\lambda$)", fontsize=12)
+
+    fig.tight_layout()
+    return fig
+
+
+def mean_squared_error(
+    sampling_densities: xr.DataArray,
+    rates: xr.DataArray,
+    hazard: xr.Dataset,
+    n: int,
+) -> xr.Dataset:
+    lambda_i = hazard.hazard
+    lambda_rup_i = rates
+    total_hazard = lambda_i.sum("rupture") + hazard.ds_hazard
+    n_i = np.round(n * sampling_densities)
+    # Expected value of estimator is total hazard - hazard from ruptures we don't sample
+    # by linearity of expectations.
+    bias = lambda_i.where(n_i == 0, 0).sum("rupture")
+    p_sigma_sq = (lambda_rup_i * lambda_i) - np.square(lambda_i)
+    variance = (p_sigma_sq / n_i.where(n_i > 0)).sum("rupture")
+    mse = np.square(bias) + variance
+    r = len(lambda_i.rupture)
+    ess = r * p_sigma_sq.sum("rupture") / mse
+    return xr.Dataset(
+        dict(hazard=total_hazard, bias=bias, variance=variance, mse=mse, ess=ess),
+        attrs=dict(n=n),
+    )
+
+
+def multinomial_error(
+    sampling_densities: xr.DataArray,
+    rates: xr.DataArray,
+    hazard: xr.Dataset,
+    n: int,
+) -> xr.Dataset:
+    # 1. Setup
+    lambda_i = hazard.hazard
+    lambda_rup_i = rates
+    total_lambda_rup = lambda_i.sum("rupture")
+    # Dataset total hazard (for reporting)
+    total_hazard = total_lambda_rup + hazard.ds_hazard
+
+    term1 = ((lambda_rup_i * lambda_i) / sampling_densities).sum("rupture")
+    variance = (1 / n) * (term1 - np.square(total_lambda_rup))
+
+    bias = xr.full_like(variance, 0.0)  # Bias is analytically zero here
+    mse = variance  # Since Bias = 0
+    p_sigma_sq = (lambda_rup_i * lambda_i) - np.square(lambda_i)
+    # ESS based on your factor of R logic
+    # ESS = N * (Var_equal / Var_actual)
+    r = len(lambda_i.rupture)
+    ess = r * p_sigma_sq.sum("rupture") / mse
+
+    return xr.Dataset(
+        dict(hazard=total_hazard, bias=bias, variance=variance, mse=mse, ess=ess),
+        attrs=dict(n=n),
+    )
+
+
+def plot_performance_metrics(ds_site):
+    # 1. Prepare the Data
+    df = ds_site.to_dataframe().reset_index()
+
+    # Calculate Relative RMSE (The 'Error Margin' as a percentage)
+    df["rel_rmse_pct"] = (np.sqrt(df["mse"]) / df["hazard"]) * 100
+    # 2. Setup the figure
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6), sharex=True)
+
+    # Use a sequential palette for the periods
+    palette = sns.color_palette("rocket", n_colors=df["period"].nunique())
+
+    # --- Plot 1: Relative Error ---
+    sns.lineplot(
+        data=df,
+        x="hazard",
+        y="rel_rmse_pct",
+        hue="period",
+        palette=palette,
+        ax=ax1,
+        legend=False,
+        alpha=0.8,
+    )
+    rate_2_in_50 = -np.log(1 - 0.02) / 50
+    ax1.axvline(x=rate_2_in_50, linestyle="-", c="r", label="2% in 50yr")
+    ax2.axvline(x=rate_2_in_50, linestyle="-", c="r", label="2% in 50yr")
+    ax2.axhline(y=ds_site.attrs["n"], label="Baseline")
+    ax1.set_xscale("log")
+    ax1.set_yscale("log")
+    ax1.invert_xaxis()  # High hazard on left, low on right
+    ax1.set_title(r"Relative Error ($\sqrt{MSE} / \lambda_{total}$ %)", fontsize=13)
+    ax1.set_ylabel("Error Percentage (%)")
+    ax1.set_xlabel(r"Total Hazard ($\lambda$)")
+    ax1.grid(True, which="both", ls="-", alpha=0.2)
+
+    # --- Plot 2: ESS ---
+    sns.lineplot(
+        data=df,
+        x="hazard",
+        y="ess",
+        hue="period",
+        palette=palette,
+        ax=ax2,
+        alpha=0.8,
+    )
+
+    ax2.set_yscale("log")
+    ax2.set_title("Effective Sample Size (ESS)", fontsize=13)
+    ax2.set_ylabel("ESS (Baseline: Equal Allocation)")
+    ax2.set_xlabel(r"Total Hazard ($\lambda$)")
+    ax2.grid(True, which="both", ls="-", alpha=0.2)
+    sns.move_legend(ax2, "upper right")
+    fig.suptitle(
+        f"Sampling Efficiency Analysis: Site {ds_site.site.values}",
+        fontsize=15,
+    )
+    fig.tight_layout()  # account for suptitle
+    return fig
+
+
+def spatial_error_map(error: xr.Dataset, sites: gpd.GeoDataFrame) -> folium.Map:
+    rmse = (np.sqrt(error.mse) / error.hazard).mean("period") * 100
+    target_hazard = -np.log(1 - 0.02) / 50
+    threshold_vals = (
+        np.abs(error.hazard - target_hazard).idxmin("threshold").mean("period")
+    )
+    rmse_at_target = rmse.sel(threshold=threshold_vals, method="nearest")
+    sites["rmse"] = rmse_at_target.to_series()
+    return sites.explore("rmse", marker_kwds=dict(radius=10))
+
+
+def effective_n(density_dataset, m: int, limit=100000):
+    arr = density_dataset.values
+
+    result = bisect.bisect_left(
+        range(limit), 0, key=lambda n: np.round(n * arr).sum() - m
+    )
+    return result
+
+
+@app.command()
+def plot_density_inspection(
+    density_dataset_path: Path,
+    hazard_path: Path,
+    ruptures_path: Path,
+    site_path: Path,
+    n: int,
+    target_rate_index: int,
+    sites: list[str],
+    random: bool = False,
+    output: Path | None = None,
+) -> None:
+    """ """
+    if not output:
+        print("Must provide output path")
+        return
+    output.mkdir(parents=True, exist_ok=True)
+    ruptures = gpd.read_parquet(ruptures_path).rename_axis("rupture")
+    rates = ruptures["rate"].to_xarray()
+
+    with (
+        xr.open_dataarray(density_dataset_path, engine="h5netcdf") as density_dataset,
+        xr.open_dataset(hazard_path, engine="h5netcdf") as hazard,
+    ):
+        density_heatmap = plot_kl_divergence_period_heatmap(density_dataset)
+
+        rate_heatmap = plot_pairwise_rate_kl_divergence(density_dataset)
+
+        if not random:
+            n = effective_n(density_dataset.isel(period=0, rate=target_rate_index), n)
+            total = int(
+                np.round(
+                    n * density_dataset.isel(period=0, rate=target_rate_index).values
+                ).sum()
+            )
+            print(f"Effective {n=}, with {total=}")
+
+        if random:
+            error = multinomial_error(
+                density_dataset.isel(period=0, rate=target_rate_index), rates, hazard, n
+            )
+        else:
+            error = mean_squared_error(
+                density_dataset.isel(period=0, rate=target_rate_index), rates, hazard, n
+            )
+    density_heatmap.savefig(output / "period_divergence.png", dpi=300)
+    plt.close(density_heatmap)
+
+    rate_heatmap.savefig(output / "rate_divergence.png", dpi=300)
+    plt.close(rate_heatmap)
+    plot_site_performance_to(error.sel(site=sites), output)
+    sites_gdf = gpd.read_parquet(site_path)
+    m = spatial_error_map(error, sites_gdf)
+    m.save(output / "error_map.html")
+
+
+def plot_site_performance_to(error: xr.Dataset, output: Path) -> None:
+    output_dir = output / "sites"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for site in error.site:
+        fig = plot_performance_metrics(error.sel(site=site))
+        fig.savefig(output_dir / f"{site.item()}.png", dpi=300)
+        plt.close(fig)
 
 
 NZ_COASTLINE_URL = "https://www.dropbox.com/scl/fi/zkohh794y0s2189t7b1hi/NZ.gmt?rlkey=02011f4morc4toutt9nzojrw1&st=vpz2ri8x&dl=1"
