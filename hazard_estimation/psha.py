@@ -7,7 +7,6 @@ import cyclopts
 import geopandas as gpd
 import numba
 import numpy as np
-import numpy.typing as npt
 import oq_wrapper as oqw
 import pandas as pd
 import scipy as sp

@@ -9,7 +9,6 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pooch
-import scipy as sp
 import seaborn as sns
 import shapely
 import tqdm
