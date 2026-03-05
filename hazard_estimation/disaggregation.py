@@ -145,6 +145,32 @@ def random_sampling_variance(
 
 
 @app.command()
+def evaluate_monte_carlo_sample(
+    monte_carlo_hazard_path: Path,
+    ruptures_path: Path,
+    site_path: Path,
+    hazard_path: Path,
+    output_path: Path,
+    sites: list[str],
+):
+    ruptures = gpd.read_parquet(ruptures_path).rename_axis("rupture")
+    rates = ruptures["rate"].to_xarray()
+    with (
+        xr.open_dataset(hazard_path, engine="h5netcdf") as composite_hazard,
+        xr.open_dataset(
+            monte_carlo_hazard_path, engine="h5netcdf"
+        ) as monte_carlo_hazard,
+    ):
+        error = experimental_error(monte_carlo_hazard, rates, composite_hazard)
+
+    output_path.mkdir(exist_ok=True, parents=True)
+    plot_site_performance_to(error.sel(site=sites), output_path, empirical=True)
+    sites_gdf = gpd.read_parquet(site_path)
+    m = spatial_error_map(error, sites_gdf)
+    m.save(output_path / "error_map.html")
+
+
+@app.command()
 def evaluate_sampling_strategy(
     sampling_densities_path: Path,
     hazard_path: Path,
@@ -269,6 +295,9 @@ def plot_pairwise_rate_kl_divergence(da: xr.DataArray):
     return fig
 
 
+#
+
+
 def mean_squared_error(
     sampling_densities: xr.DataArray,
     rates: xr.DataArray,
@@ -323,6 +352,148 @@ def multinomial_error(
     )
 
 
+def experimental_error(
+    experimental_hazard: xr.Dataset, rates: xr.DataArray, hazard: xr.Dataset
+) -> xr.Dataset:
+    total_experimental_hazard = (
+        experimental_hazard.hazard + experimental_hazard.ds_hazard
+    )
+    lambda_i = hazard.hazard
+    lambda_rup_i = rates
+    total_lambda_rup = lambda_i.sum("rupture")
+
+    total_hazard = total_lambda_rup + hazard.ds_hazard
+    se = np.square(total_experimental_hazard - total_hazard)
+    mse = se.mean("realisation")
+    n_realisations = len(experimental_hazard.realisation)
+    mse_se = se.std("realisation") / np.sqrt(n_realisations)
+    ci_95 = 1.96 * mse_se
+    mse_lower = (mse - ci_95).clip(min=0)
+    mse_upper = mse + ci_95
+
+    p_sigma_sq = (lambda_rup_i * lambda_i) - np.square(lambda_i)
+    r = len(lambda_i.rupture)
+    constant_numerator = r * p_sigma_sq.sum("rupture")
+    ess = constant_numerator / mse
+    ess_lower = constant_numerator / mse_upper
+    # Use xr.where to avoid dividing by 0 if mse_lower is exactly 0
+    ess_upper = xr.where(mse_lower > 0, constant_numerator / mse_lower, np.nan)
+    return xr.Dataset(
+        dict(
+            hazard=total_hazard,
+            mse=mse,
+            mse_lower=mse_lower,
+            mse_upper=mse_upper,
+            ess=ess,
+            ess_lower=ess_lower,
+            ess_upper=ess_upper,
+        ),
+    )
+
+
+def plot_empirical_performance_metrics(ds_site):
+    # 1. Prepare Data
+    df = ds_site.to_dataframe().reset_index()
+
+    # Calculate Relative RMSE and bounds (%)
+    df["rel_rmse_pct"] = (np.sqrt(df["mse"]) / df["hazard"]) * 100
+    df["rel_rmse_pct_lower"] = (np.sqrt(df["mse_lower"]) / df["hazard"]) * 100
+    df["rel_rmse_pct_upper"] = (np.sqrt(df["mse_upper"]) / df["hazard"]) * 100
+
+    # 2. Setup Figure
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6), sharex=True)
+
+    periods = df["period"].unique()
+    palette = sns.color_palette("rocket", n_colors=len(periods))
+
+    # 3. Iterate over periods to plot the mean line and shaded confidence intervals
+    for i, p in enumerate(periods):
+        p_data = df[df["period"] == p].sort_values("hazard", ascending=False)
+        color = palette[i]
+
+        # --- Plot 1: Relative RMSE ---
+        ax1.plot(
+            p_data["hazard"],
+            p_data["rel_rmse_pct"],
+            color=color,
+            alpha=0.9,
+            label=f"{p}s",
+        )
+        ax1.fill_between(
+            p_data["hazard"],
+            p_data["rel_rmse_pct_lower"],
+            p_data["rel_rmse_pct_upper"],
+            color=color,
+            alpha=0.15,
+            edgecolor="none",
+        )
+
+        # --- Plot 2: ESS ---
+        ax1_line = ax2.plot(
+            p_data["hazard"], p_data["ess"], color=color, alpha=0.9, label=f"{p}s"
+        )
+        # Drop NaNs to prevent matplotlib fill_between artifacts if ess_upper hit infinity
+        valid_ess = p_data.dropna(subset=["ess_lower", "ess_upper"])
+        ax2.fill_between(
+            valid_ess["hazard"],
+            valid_ess["ess_lower"],
+            valid_ess["ess_upper"],
+            color=color,
+            alpha=0.15,
+            edgecolor="none",
+        )
+
+    # 4. Formatting and reference lines
+    rate_2_in_50 = -np.log(1 - 0.02) / 50
+    # Changed to gray dashed to not clash visually with the 'rocket' palette
+    ax1.axvline(x=rate_2_in_50, linestyle="--", c="gray", label="2% in 50yr")
+    ax2.axvline(x=rate_2_in_50, linestyle="--", c="gray", label="2% in 50yr")
+
+    if "n" in ds_site.attrs:
+        ax2.axhline(
+            y=ds_site.attrs["n"], color="black", linestyle=":", label="Baseline N"
+        )
+
+    # Ax 1 format
+    ax1.set_ylim(1e-2, 100)
+    ax1.set_xscale("log")
+    ax1.set_yscale("log")
+
+    ax1.invert_xaxis()
+    ax1.set_title(
+        r"Relative Empirical Error ($\sqrt{MSE} / \lambda_{total}$ %)", fontsize=13
+    )
+    ax1.set_ylabel("Error Percentage (%)")
+    ax1.set_xlabel(r"Total Hazard ($\lambda$)")
+    ax1.grid(True, which="both", ls="-", alpha=0.2)
+
+    # Ax 2 format
+    ax2.set_yscale("log")
+    ax2.set_title("Empirical Effective Sample Size (ESS)", fontsize=13)
+    ax2.set_ylabel("ESS (Baseline: Equal Allocation)")
+    ax2.set_xlabel(r"Total Hazard ($\lambda$)")
+    ax2.grid(True, which="both", ls="-", alpha=0.2)
+
+    # Unified Legend outside the plot
+    handles, labels = ax1.get_legend_handles_labels()
+    # Filter unique handles/labels to avoid duplicates
+    by_label = dict(zip(labels, handles))
+    ax2.legend(
+        by_label.values(),
+        by_label.keys(),
+        loc="upper right",
+        title="Period (s)",
+        bbox_to_anchor=(1.25, 1),
+    )
+
+    # Title
+    site_name = ds_site.site.values
+    fig.suptitle(f"Monte Carlo Sampling Efficiency Analysis: {site_name}", fontsize=15)
+    fig.tight_layout()
+
+    return fig
+
+
 def plot_performance_metrics(ds_site):
     # 1. Prepare the Data
     df = ds_site.to_dataframe().reset_index()
@@ -349,7 +520,9 @@ def plot_performance_metrics(ds_site):
     rate_2_in_50 = -np.log(1 - 0.02) / 50
     ax1.axvline(x=rate_2_in_50, linestyle="-", c="r", label="2% in 50yr")
     ax2.axvline(x=rate_2_in_50, linestyle="-", c="r", label="2% in 50yr")
-    ax2.axhline(y=ds_site.attrs["n"], label="Baseline")
+    if "n" in ds_site.attrs:
+        ax2.axhline(y=ds_site.attrs["n"], label="Baseline")
+    ax1.set_ylim(1e-2, 100)
     ax1.set_xscale("log")
     ax1.set_yscale("log")
     ax1.invert_xaxis()  # High hazard on left, low on right
@@ -459,11 +632,16 @@ def plot_density_inspection(
     m.save(output / "error_map.html")
 
 
-def plot_site_performance_to(error: xr.Dataset, output: Path) -> None:
+def plot_site_performance_to(
+    error: xr.Dataset, output: Path, empirical: bool = False
+) -> None:
     output_dir = output / "sites"
     output_dir.mkdir(parents=True, exist_ok=True)
     for site in error.site:
-        fig = plot_performance_metrics(error.sel(site=site))
+        if empirical:
+            fig = plot_empirical_performance_metrics(error.sel(site=site))
+        else:
+            fig = plot_performance_metrics(error.sel(site=site))
         fig.savefig(output_dir / f"{site.item()}.png", dpi=300)
         plt.close(fig)
 
