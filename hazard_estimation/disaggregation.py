@@ -307,7 +307,7 @@ def mean_squared_error(
     lambda_i = hazard.hazard
     lambda_rup_i = rates
     total_hazard = lambda_i.sum("rupture") + hazard.ds_hazard
-    n_i = np.round(n * sampling_densities)
+    n_i = np.round(n * sampling_densities).astype(int)
     # Expected value of estimator is total hazard - hazard from ruptures we don't sample
     # by linearity of expectations.
     bias = lambda_i.where(n_i == 0, 0).sum("rupture")
