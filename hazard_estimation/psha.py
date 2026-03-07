@@ -320,11 +320,6 @@ def calculate_monte_carlo_hazard(
 ) -> xr.DataArray:
     """End-to-end Python API for monte carlo hazard."""
     ruptures["count"] = np.round(n * ruptures[column]).astype(int)
-    realisations = monte_carlo_sample(
-        ruptures, ruptures["count"], STDDEV_LOWER, STDDEV_UPPER
-    )
-    rrup = rupture_distances(source_to_site).sel(site=sites.index.values)
-    gmm_inputs = ground_motion_inputs(realisations.magnitudes, rrup, sites)
 
     rng = np.random.default_rng(seed=seed)
 
@@ -332,6 +327,12 @@ def calculate_monte_carlo_hazard(
     pbar = tqdm.tqdm(periods, unit="Period", position=1, leave=False)
     for period in pbar:
         pbar.set_description(f"pSA({period:.2f})")
+        realisations = monte_carlo_sample(
+            ruptures, ruptures["count"], STDDEV_LOWER, STDDEV_UPPER
+        )
+        rrup = rupture_distances(source_to_site).sel(site=sites.index.values)
+        gmm_inputs = ground_motion_inputs(realisations.magnitudes, rrup, sites)
+
         gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period)
         hazard = aggregate_monte_carlo_hazard(
             gmm_outputs,
