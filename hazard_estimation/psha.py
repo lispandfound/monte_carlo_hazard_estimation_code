@@ -12,6 +12,7 @@ import pandas as pd
 import scipy as sp
 import tqdm
 import xarray as xr
+from numba_stats import norm
 
 Array1 = np.ndarray[tuple[int,], np.dtype[np.float64]]
 Array2 = np.ndarray[tuple[int, int], np.dtype[np.float64]]
@@ -149,63 +150,60 @@ def run_ground_motion_model(
     )
 
 
-@numba.njit(cache=True)
-def _threshold_reduction(
-    ground_motions: Array1,
-    n_sites: int,
-    samples_per_rupture: IArray1,
-    thresholds: Array1,
-) -> IArray3:
-    n_ruptures = len(samples_per_rupture)
-    occupancy_matrix = np.zeros((n_sites, n_ruptures, len(thresholds)), dtype=np.int64)
+@numba.njit(parallel=True, fastmath=True, cache=True)
+def _threshold_reduction_optimized(mean, stddev, samples, thresholds):
+    n_sites, n_ruptures = mean.shape
+    n_thresh = len(thresholds)
+    occupancy_matrix = np.zeros((n_sites, n_ruptures, n_thresh), dtype=np.int64)
 
-    k = 0
-    for i in range(n_sites):
+    for i in numba.prange(n_sites):
         for j in range(n_ruptures):
-            n_samples = samples_per_rupture[j]
+            n_samples = samples[j]
             if n_samples == 0:
                 continue
-            values = ground_motions[k : k + n_samples]
-            threshold_vals = np.searchsorted(thresholds, values)
-            for v in threshold_vals:
-                occupancy_matrix[i, j, :v] += 1
-            k += n_samples
+
+            mu = mean[i, j]
+            sigma = stddev[i, j]
+
+            for _ in range(n_samples):
+                val = np.random.normal(mu, sigma)
+                idx = np.searchsorted(thresholds, val)
+                for t in range(idx):
+                    occupancy_matrix[i, j, t] += 1
+
     return occupancy_matrix
 
 
 def monte_carlo_threshold_occupancy(
     ground_motion_observations: xr.Dataset,
     thresholds: Array1,
-    rng: np.random.Generator,
 ) -> xr.DataArray:
-    sampled_ground_motions = xr.apply_ufunc(
-        rng.normal,
-        ground_motion_observations.log_mean,
-        ground_motion_observations.log_stddev,
-    ).sortby(["site", "rupture"])
 
-    sites = np.unique(sampled_ground_motions.site.values)
-    ruptures, sample_count = np.unique(
-        sampled_ground_motions.rupture.values, return_counts=True
-    )
-    sample_count //= len(sites)
-    occupancy_count = _threshold_reduction(
-        sampled_ground_motions.values, len(sites), sample_count, np.log(thresholds)
+    thresholds_da = xr.DataArray(
+        np.log(thresholds), dims=["threshold"], coords={"threshold": thresholds}
     )
 
-    occupancy_count_da = xr.DataArray(
-        occupancy_count,
-        dims=("site", "rupture", "threshold"),
-        coords=dict(site=sites, rupture=ruptures, threshold=thresholds),
+    counts = xr.apply_ufunc(
+        _threshold_reduction_optimized,
+        ground_motion_observations.log_mean,  # Core dims: ['sites', 'ruptures']
+        ground_motion_observations.log_stddev,  # Core dims: ['sites', 'ruptures']
+        ground_motion_observations.samples,  # Core dims: ['ruptures']
+        thresholds_da,  # Core dim: ['threshold']
+        input_core_dims=[
+            ["site", "rupture"],
+            ["site", "rupture"],
+            ["rupture"],
+            ["threshold"],
+        ],
+        output_core_dims=[["site", "rupture", "threshold"]],
+        vectorize=True,  # This handles the 'n_retries' or other extra dimensions
+        dask="parallelized",
     )
-    sample_count_da = xr.DataArray(
-        sample_count, dims="rupture", coords=dict(rupture=ruptures)
-    )
-
-    return occupancy_count_da / sample_count_da
+    poe = counts / ground_motion_observations.samples
+    return poe
 
 
-@numba.njit(parallel=True, cache=True)
+@numba.njit(parallel=True, cache=True, fastmath=True)
 def _analytical_threshold_reduction(
     log_mean: np.ndarray,
     log_stddev: np.ndarray,
@@ -216,7 +214,6 @@ def _analytical_threshold_reduction(
     nt = len(threshold)
 
     poe = np.zeros((n_site, n_rupture, nt), dtype=log_mean.dtype)
-    sqrt2 = np.sqrt(2)
 
     for i in numba.prange(n_site):
         for j in range(n_rupture):
@@ -226,7 +223,7 @@ def _analytical_threshold_reduction(
                 for l in range(nz):
                     mu = log_mean[i, j, l]
                     sigma = log_stddev[i, j, l]
-                    exceedance_prob = 0.5 * math.erfc((t - mu) / (sigma * sqrt2))
+                    exceedance_prob = 1.0 - norm.cdf(np.array([t]), mu, sigma)[0]
                     integral_sum += exceedance_prob * weights[l]
                 poe[i, j, k] = integral_sum
 
@@ -246,23 +243,27 @@ def trapezium_integration_weights(
 
 
 def analytical_threshold_occupancy(
-    ground_motion_observations: xr.Dataset, thresholds: Array1, weights: Array1
+    ground_motion_observations: xr.Dataset, thresholds: Array1, weights: xr.DataArray
 ) -> xr.DataArray:
-    cond_prob = _analytical_threshold_reduction(
-        ground_motion_observations.log_mean.values,
-        ground_motion_observations.log_stddev.values,
-        weights,
-        np.log(thresholds),
+    """
+    Computes analytical threshold occupancy using survival functions and
+    weighted integration over the z-dimension.
+    """
+    thresholds_da = xr.DataArray(
+        np.log(thresholds), dims=["threshold"], coords={"threshold": thresholds}
     )
-    return xr.DataArray(
-        cond_prob,
-        dims=("site", "rupture", "threshold"),
-        coords=dict(
-            site=ground_motion_observations.site.values,
-            rupture=ground_motion_observations.rupture.values,
-            threshold=thresholds,
-        ),
+
+    exceedance_probs = xr.apply_ufunc(
+        sp.stats.norm.sf,
+        thresholds_da,
+        ground_motion_observations.log_mean,
+        ground_motion_observations.log_stddev,
+        dask="allowed",
     )
+
+    occupancy_prob = (exceedance_probs * weights).sum(dim="z")
+
+    return occupancy_prob
 
 
 def aggregate_analytical_hazard(
