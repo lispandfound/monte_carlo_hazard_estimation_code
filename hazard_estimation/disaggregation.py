@@ -41,7 +41,7 @@ def generate_source_to_site(source_to_site_df: pd.DataFrame) -> psha.SourceToSit
 def hazard_thresholds(composite_hazard: xr.Dataset, target_rate: float) -> xr.DataArray:
     rupture_hazard = composite_hazard["hazard"].sum("rupture")
     total_hazard = rupture_hazard + composite_hazard["ds_hazard"]
-    threshold = np.abs(total_hazard - target_rate).idxmin("threshold")
+    threshold = np.abs(total_hazard - target_rate).argmin("threshold")
     return threshold
 
 
@@ -65,14 +65,14 @@ def period_independent_population_and_ds_weighted_sampling(
     random: bool = False,
 ) -> xr.DataArray:
     thresholds = hazard_thresholds(composite_hazard, rates)
-    rupture_hazard = composite_hazard.hazard.sel(threshold=thresholds).sel(
+    rupture_hazard = composite_hazard.hazard.isel(threshold=thresholds).sel(
         period=periods, method="nearest"
     )
     sampling_density = optimal_hazard_sampling_densities(
         rupture_hazard, ruptures["rate"], random=random
     )
 
-    ds_hazard = composite_hazard.ds_hazard.sel(threshold=thresholds).sel(
+    ds_hazard = composite_hazard.ds_hazard.isel(threshold=thresholds).sel(
         period=periods, method="nearest"
     )
     ds_contribution = ds_hazard / (
@@ -723,10 +723,10 @@ def population_density(
         .overlay(population_blocks, how="intersection")
     )
     population_in_cells = block_resolved.groupby("site")[population_column].sum()
-    gdf["population_density"] = population_in_cells / population_in_cells.sum()
     # Some cells have no population blocks in them, we assume no population here.
-    gdf["population_density"] = gdf["population_density"].fillna(0.0)
-    return gdf
+    population_in_cells = population_in_cells.fillna(0.0)
+    population_in_cells /= population_in_cells.sum()
+    return population_in_cells
 
 
 def _rasterize_batch(

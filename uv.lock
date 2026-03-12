@@ -582,6 +582,23 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/51/e0/71b63839cc609e1d62cea2fc9774aa605ece7ea78af823ff7a8f1c560e72/fiona-1.10.1.tar.gz", hash = "sha256:b00ae357669460c6491caba29c2022ff0acfcbde86a95361ea8ff5cd14a86b68", size = 444606, upload-time = "2024-09-16T20:15:47.074Z" }
 
 [[package]]
+name = "flox"
+version = "0.11.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "numpy-groupies" },
+    { name = "packaging" },
+    { name = "pandas" },
+    { name = "scipy" },
+    { name = "toolz" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/61/fd/94b6e6dba647c062434f21b40efe800ca3fed2292856f82c816a8a626b97/flox-0.11.2.tar.gz", hash = "sha256:ca48d391e4a06cdf1c24368bf73114191851149611a5b318d82436fa713efdf0", size = 956626, upload-time = "2026-02-26T05:41:53.575Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/de/7b/4ce04d96cb4538ab3eab6bbcc06e624bbbc3661011bfab0b536f4fb026ab/flox-0.11.2-py3-none-any.whl", hash = "sha256:d3932bfe9e26729dd7e471c4d448abeaee7a62272621f584de0e704b3c0665cb", size = 89143, upload-time = "2026-02-26T05:41:54.725Z" },
+]
+
+[[package]]
 name = "folium"
 version = "0.20.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1114,17 +1131,21 @@ dependencies = [
     { name = "altair" },
     { name = "cyclopts" },
     { name = "deptry" },
+    { name = "flox" },
     { name = "folium" },
     { name = "geocube" },
     { name = "mapclassify" },
     { name = "matplotlib" },
     { name = "nshmdb" },
+    { name = "numba" },
+    { name = "numba-stats" },
     { name = "numpy" },
     { name = "oq-wrapper" },
     { name = "pandas", extra = ["parquet"] },
     { name = "scikit-learn" },
     { name = "scipy" },
     { name = "seaborn" },
+    { name = "shapely" },
     { name = "source-modelling" },
     { name = "standard-imghdr" },
     { name = "streamlit" },
@@ -1152,12 +1173,15 @@ requires-dist = [
     { name = "altair", specifier = "<5" },
     { name = "cyclopts", specifier = ">=4.5.0" },
     { name = "deptry", specifier = ">=0.24.0" },
+    { name = "flox", specifier = ">=0.11.2" },
     { name = "folium", specifier = ">=0.20.0" },
     { name = "geocube", specifier = ">=0.7.1" },
     { name = "ipython", marker = "extra == 'dev'", specifier = ">=9.9.0" },
     { name = "mapclassify", specifier = ">=2.10.0" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "nshmdb", specifier = ">=2025.12.1" },
+    { name = "numba", specifier = ">=0.63.1" },
+    { name = "numba-stats", specifier = ">=1.11.0" },
     { name = "numpy", specifier = ">=2.3.5" },
     { name = "numpydoc", marker = "extra == 'dev'", specifier = ">=1.10.0" },
     { name = "oq-wrapper", specifier = ">=2025.12.5" },
@@ -1169,6 +1193,7 @@ requires-dist = [
     { name = "scipy", specifier = ">=1.17.0" },
     { name = "scipy-stubs", marker = "extra == 'types'", specifier = ">=1.17.0.1" },
     { name = "seaborn", specifier = ">=0.13.2" },
+    { name = "shapely", specifier = ">=2.1.2" },
     { name = "source-modelling", specifier = ">=2025.12.1" },
     { name = "standard-imghdr", specifier = ">=3.13.0" },
     { name = "streamlit", specifier = ">=1.19.0" },
@@ -1261,6 +1286,20 @@ wheels = [
 ]
 
 [[package]]
+name = "numba-stats"
+version = "1.11.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numba" },
+    { name = "numpy" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/47/a6/e339072b49f3678651e819a2218777fd25770242c8c813cf5a69c5f17c57/numba_stats-1.11.0.tar.gz", hash = "sha256:480bef381de1cb2ee666d3dabf6cdc6f6b5ff4617eb2d2e36d1e473a58e6afd4", size = 218486, upload-time = "2025-07-27T15:05:46.878Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/63/43/e13af152854e60b0d5b48c9340957f6ed24b9239b711dc2ad874544b9f47/numba_stats-1.11.0-py3-none-any.whl", hash = "sha256:9b61a71743f0f1448f961fd79ecf7125b24323aae296bace78220582fb35557f", size = 27525, upload-time = "2025-07-27T15:05:45.376Z" },
+]
+
+[[package]]
 name = "numcodecs"
 version = "0.16.5"
 source = { registry = "https://pypi.org/simple" }
@@ -1305,6 +1344,18 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/51/41/851c4b4082402d9ea860c3626db5d5df47164a712cb23b54be028b184c1c/numpy-2.3.5-cp314-cp314t-win32.whl", hash = "sha256:93eebbcf1aafdf7e2ddd44c2923e2672e1010bddc014138b229e49725b4d6be5", size = 6479806, upload-time = "2025-11-16T22:52:14.641Z" },
     { url = "https://files.pythonhosted.org/packages/90/30/d48bde1dfd93332fa557cff1972fbc039e055a52021fbef4c2c4b1eefd17/numpy-2.3.5-cp314-cp314t-win_amd64.whl", hash = "sha256:c8a9958e88b65c3b27e22ca2a076311636850b612d6bbfb76e8d156aacde2aaf", size = 13105760, upload-time = "2025-11-16T22:52:17.975Z" },
     { url = "https://files.pythonhosted.org/packages/2d/fd/4b5eb0b3e888d86aee4d198c23acec7d214baaf17ea93c1adec94c9518b9/numpy-2.3.5-cp314-cp314t-win_arm64.whl", hash = "sha256:6203fdf9f3dc5bdaed7319ad8698e685c7a3be10819f41d32a0723e611733b42", size = 10545459, upload-time = "2025-11-16T22:52:20.55Z" },
+]
+
+[[package]]
+name = "numpy-groupies"
+version = "0.11.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/7d/ff/0559b586423d9a59feac52c2261501106dcd61e45214862de5fbb03b78cb/numpy_groupies-0.11.3.tar.gz", hash = "sha256:aed4afdad55e856b9e737fe4b4673c77e47c2f887c3663a18baaa200407c23e0", size = 159159, upload-time = "2025-05-22T11:47:58.364Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b0/e0/760e73c111193db5ca37712a148e4807d1b0c60302ab31e4ada6528ca34d/numpy_groupies-0.11.3-py3-none-any.whl", hash = "sha256:d4065dd5d56fda941ad5a7c80a7f80b49f671ed148aaa3e243a0e4caa71adcb3", size = 40784, upload-time = "2025-05-22T11:47:56.997Z" },
 ]
 
 [[package]]
