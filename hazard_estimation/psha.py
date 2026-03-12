@@ -1,5 +1,6 @@
 """Analytically integrate PSHA to obtain a hazard curve"""
 
+import functools
 import math
 from pathlib import Path
 
@@ -10,9 +11,9 @@ import numpy as np
 import oq_wrapper as oqw
 import pandas as pd
 import scipy as sp
+import shapely
 import tqdm
 import xarray as xr
-from numba_stats import norm
 
 Array1 = np.ndarray[tuple[int,], np.dtype[np.float64]]
 Array2 = np.ndarray[tuple[int, int], np.dtype[np.float64]]
@@ -126,6 +127,110 @@ def ground_motion_inputs(
     return dset.stack(realisation=dset.dims)
 
 
+RRUP_INTERPOLANTS = np.array(
+    [
+        [
+            3.5,
+            3.6,
+            3.7,
+            3.8,
+            3.9,
+            4.0,
+            4.1,
+            4.2,
+            4.3,
+            4.4,
+            4.5,
+            4.6,
+            4.7,
+            4.8,
+            4.9,
+            5.0,
+            5.1,
+            5.2,
+            5.3,
+            5.4,
+            5.5,
+            5.6,
+            5.7,
+            5.8,
+            6.0,
+            6.5,
+            7.0,
+            7.5,
+            8.0,
+        ],
+        [
+            96.001584,
+            95.96318337,
+            98.0,
+            102.0,
+            108.02690269,
+            114.86856676,
+            123.44523863,
+            128.68959965,
+            134.58683383,
+            145.68111725,
+            157.68992642,
+            170.68864766,
+            188.45405921,
+            192.22314039,
+            203.98873437,
+            216.47447683,
+            233.19667576,
+            248.66112894,
+            258.19003824,
+            268.72840715,
+            280.03281854,
+            297.1730673,
+            300.0,
+            300.0,
+            300.0,
+            300.0,
+            300.0,
+            300.0,
+            300.0,
+        ],
+    ]
+)
+
+
+def estimate_compute(
+    ruptures: pd.DataFrame, clip_geometry: shapely.Geometry, resolution: float
+) -> pd.DataFrame:
+    mean_mag, _ = get_leonard_magnitude_params(ruptures["area"] / 1e6, ruptures["rake"])
+
+    rrup = pd.Series(
+        np.interp(mean_mag, RRUP_INTERPOLANTS[0], RRUP_INTERPOLANTS[1]),
+        index=mean_mag.index,
+    )
+    fault_area = shapely.intersection(
+        shapely.buffer(ruptures["geometry"], rrup), clip_geometry
+    )
+
+    bounding_box = shapely.minimum_rotated_rectangle(fault_area)
+    corner_distance = np.sqrt(2) * rrup
+    ctx = pd.DataFrame(dict(rrup=corner_distance))
+    ctx["mag"] = mean_mag
+    ctx["rake"] = ruptures["rake"]
+    vs30 = 500.0
+    ctx["vs30"] = vs30
+    ctx["z1pt0"] = oqw.estimations.chiou_young_08_calc_z1p0(vs30)
+
+    ds595_output = oqw.run_gmm(
+        oqw.constants.GMM.AS_16, oqw.constants.TectType.ACTIVE_SHALLOW, ctx, "Ds595"
+    )
+    ds595 = np.exp(ds595_output["Ds595_mean"])
+    dt = resolution / 20.0
+    nt = (corner_distance / 3.5 + ds595) / dt
+    area = shapely.area(bounding_box) / (1e6 * resolution)
+    compute = area * nt
+    compute_df = pd.DataFrame(dict(compute=compute))
+    compute_df["nt"] = nt
+    compute_df["area"] = area
+    return compute_df
+
+
 def run_ground_motion_model(
     ground_motion_inputs: xr.Dataset, intensity_measure: str, period: float
 ) -> xr.Dataset:
@@ -150,7 +255,7 @@ def run_ground_motion_model(
     )
 
 
-@numba.njit(parallel=True, fastmath=True, cache=True)
+@numba.njit(parallel=True, cache=True)
 def _threshold_reduction_optimized(mean, stddev, samples, thresholds):
     n_sites, n_ruptures = mean.shape
     n_thresh = len(thresholds)
@@ -203,47 +308,21 @@ def monte_carlo_threshold_occupancy(
     return poe
 
 
-@numba.njit(parallel=True, cache=True, fastmath=True)
-def _analytical_threshold_reduction(
-    log_mean: np.ndarray,
-    log_stddev: np.ndarray,
-    weights: np.ndarray,
-    threshold: np.ndarray,
-) -> np.ndarray:
-    (n_site, n_rupture, nz) = log_mean.shape
-    nt = len(threshold)
-
-    poe = np.zeros((n_site, n_rupture, nt), dtype=log_mean.dtype)
-
-    for i in numba.prange(n_site):
-        for j in range(n_rupture):
-            for k in range(nt):
-                t = threshold[k]
-                integral_sum = 0.0
-                for l in range(nz):
-                    mu = log_mean[i, j, l]
-                    sigma = log_stddev[i, j, l]
-                    exceedance_prob = 1.0 - norm.cdf(np.array([t]), mu, sigma)[0]
-                    integral_sum += exceedance_prob * weights[l]
-                poe[i, j, k] = integral_sum
-
-    return poe
-
-
-def trapezium_integration_weights(
-    z: Array1,
-) -> Array1:
-    phi_z = sp.stats.truncnorm.pdf(
-        z, float(STDDEV_LOWER), float(STDDEV_UPPER), loc=0.0, scale=1.0
-    )
-    dz = z[1] - z[0]
-    weights = phi_z * dz
-    weights[[0, -1]] /= 2
-    return weights
+@numba.guvectorize(
+    ["(float64, float64, float64, float64[:])"],
+    "(),(),()->()",
+    nopython=True,
+    target="parallel",
+)
+def fast_norm_sf_numba(x, mu, sigma, res):
+    z = (x - mu) / sigma
+    # As opposed to 1.0 + math.erf because of accuracy issues.
+    res[0] = 0.5 * math.erfc(z / np.sqrt(2.0))
 
 
 def analytical_threshold_occupancy(
-    ground_motion_observations: xr.Dataset, thresholds: Array1, weights: xr.DataArray
+    ground_motion_observations: xr.Dataset,
+    thresholds: Array1,
 ) -> xr.DataArray:
     """
     Computes analytical threshold occupancy using survival functions and
@@ -252,16 +331,29 @@ def analytical_threshold_occupancy(
     thresholds_da = xr.DataArray(
         np.log(thresholds), dims=["threshold"], coords={"threshold": thresholds}
     )
-
     exceedance_probs = xr.apply_ufunc(
-        sp.stats.norm.sf,
+        fast_norm_sf_numba,
         thresholds_da,
         ground_motion_observations.log_mean,
         ground_motion_observations.log_stddev,
-        dask="allowed",
+        input_core_dims=[[], [], []],
+        output_core_dims=[[]],
+        dask="forbidden",
     )
 
-    occupancy_prob = (exceedance_probs * weights).sum(dim="z")
+    phi_z = xr.apply_ufunc(
+        functools.partial(
+            sp.stats.truncnorm.pdf,
+            a=float(STDDEV_LOWER),
+            b=float(STDDEV_UPPER),
+            loc=0.0,
+            scale=1.0,
+        ),
+        ground_motion_observations.z,
+    )
+
+    exceedance_probs *= phi_z
+    occupancy_prob = exceedance_probs.integrate("z")
 
     return occupancy_prob
 
@@ -270,9 +362,9 @@ def aggregate_analytical_hazard(
     gmm_outputs: xr.Dataset, rates: xr.DataArray, thresholds: Array1
 ) -> xr.DataArray:
     """Multiplies calculated occupancy probability by the rupture rate."""
-    weights = trapezium_integration_weights(gmm_outputs.z.values)
-    cond_prob = analytical_threshold_occupancy(gmm_outputs, thresholds, weights)
-    return cond_prob * rates
+    cond_prob = analytical_threshold_occupancy(gmm_outputs, thresholds)
+    cond_prob *= rates
+    return cond_prob
 
 
 def aggregate_monte_carlo_hazard(
@@ -283,7 +375,8 @@ def aggregate_monte_carlo_hazard(
 ) -> xr.DataArray:
     """Multiplies simulated occupancy probability by calculated weights."""
     cond_prob = monte_carlo_threshold_occupancy(gmm_outputs, thresholds, rng)
-    return cond_prob * rates
+    cond_prob *= rates
+    return cond_prob
 
 
 def calculate_analytical_hazard(
@@ -330,7 +423,7 @@ def calculate_monte_carlo_hazard(
     rng = np.random.default_rng(seed=seed)
 
     hazards = []
-    pbar = tqdm.tqdm(periods, unit="Period", position=1, leave=False)
+    pbar = tqdm.tqdm(periods, unit="period", position=1, leave=False)
     for period in pbar:
         pbar.set_description(f"pSA({period:.2f})")
         gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period)
