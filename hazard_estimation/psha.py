@@ -13,7 +13,6 @@ import pandas as pd
 import scipy as sp
 import shapely
 import tqdm
-import tqdm.contrib.concurrent
 import xarray as xr
 
 Array1 = np.ndarray[tuple[int,], np.dtype[np.float64]]
@@ -415,8 +414,10 @@ def calculate_monte_carlo_hazard(
     gmm_inputs = ground_motion_inputs(realisations, rrup, sites)
     np.random.seed(seed=seed)
     hazards = []
+    pbar = tqdm.tqdm(periods, unit="period", position=1, leave=False)
 
-    for period in periods:
+    for period in pbar:
+        pbar.set_description(f"pSA({period:.2f})")
         gmm_outputs = run_ground_motion_model(
             gmm_inputs.stack(sample=gmm_inputs.dims), "pSA", period
         ).unstack()
@@ -472,24 +473,6 @@ def compute_distributed_hazard(
     return ds_hazard.interp(threshold=target_thresholds)
 
 
-def _run_single_realisation(
-    i, seed, ruptures, source_to_site, sites, periods_arr, thresholds_arr, n, column
-):
-    """Worker function for a single Monte Carlo realization."""
-    current_seed = (seed + i) if seed is not None else None
-    run_hazard = calculate_monte_carlo_hazard(
-        ruptures,
-        source_to_site,
-        sites,
-        periods_arr,
-        thresholds_arr,
-        n,
-        column,
-        current_seed,
-    )
-    return run_hazard.sum("rupture")
-
-
 @app.command()
 def hazard(
     ruptures_path: Path,
@@ -527,12 +510,11 @@ def monte_carlo_hazard(
     distributed_seismicity_path: Path,
     n: int,
     gmm_hazard_path: Path,
-    num_realisations: int = 10,
+    num_realisations: int = 10,  # Added this
     periods: list[float] | None = None,
     thresholds: list[float] | None = None,
     seed: int | None = None,
     column: str = "kl_density",
-    max_workers: int = 1,
 ) -> None:
     ruptures, source_to_site, sites = load_hazard_inputs(
         ruptures_path, source_to_site_path, sites_path
@@ -540,25 +522,27 @@ def monte_carlo_hazard(
     periods_arr = np.array(periods or DEFAULT_PERIODS)
     thresholds_arr = np.asarray(thresholds) if thresholds else THRESHOLDS
 
-    worker_func = functools.partial(
-        _run_single_realisation,
-        seed=seed,
-        ruptures=ruptures,
-        source_to_site=source_to_site,
-        sites=sites,
-        periods_arr=periods_arr,
-        thresholds_arr=thresholds_arr,
-        n=n,
-        column=column,
-    )
+    # Collect ensemble results
+    all_hazard_results = []
 
-    all_hazard_results = tqdm.contrib.concurrent.process_map(
-        worker_func,
-        range(num_realisations),
-        max_workers=max_workers,
-        chunksize=1,
-        desc="Realisations",
-    )
+    # Range is from seed to seed + num_realisations to ensure independence
+    pbar_outer = tqdm.trange(num_realisations, desc="Realisations", position=0)
+    for i in pbar_outer:
+        current_seed = (seed + i) if seed is not None else None
+        pbar_outer.set_description(
+            f"Realisation {i + 1}/{num_realisations} (Seed: {current_seed})"
+        )
+        run_hazard = calculate_monte_carlo_hazard(
+            ruptures,
+            source_to_site,
+            sites,
+            periods_arr,
+            thresholds_arr,
+            n,
+            column,
+            current_seed,
+        )
+        all_hazard_results.append(run_hazard.sum("rupture"))
 
     rupture_hazard_ensemble = xr.concat(
         all_hazard_results, dim=pd.Index(range(num_realisations), name="realisation")
