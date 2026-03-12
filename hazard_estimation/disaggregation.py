@@ -9,6 +9,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pooch
+import scipy as sp
 import seaborn as sns
 import shapely
 import tqdm
@@ -83,6 +84,34 @@ def period_independent_population_and_ds_weighted_sampling(
     weights /= weights.sum()
     sampling_density = (weights * sampling_density).sum(["period", "site"])
     return sampling_density
+
+
+def magnitude_distribution_for_sampling_distribution(
+    ruptures: gpd.GeoDataFrame,
+    sampling_density: xr.DataArray,
+    bins: int = 50,
+    m_min: float = 5.0,
+    m_max: float = 9.0,
+    z_lower: float = -1,
+    z_upper: float = 1,
+) -> xr.DataArray:
+    mean_mag, sigma = psha.get_leonard_magnitude_params(
+        ruptures["area"].values / 1e6, ruptures["rake"].values
+    )
+    m = np.linspace(m_min, m_max, num=bins + 1)
+    density = np.diff(
+        sp.stats.truncnorm(z_lower, z_upper, loc=mean_mag, scale=sigma).cdf(
+            m[:, np.newaxis]
+        ),
+        axis=0,
+    )
+    density_da = xr.DataArray(
+        density,
+        dims=["magnitude", "rupture"],
+        coords=dict(rupture=ruptures.index.values, magnitude=(m[:-1] + m[1:]) / 2),
+    )
+    density_da *= sampling_density
+    return density_da
 
 
 @app.command()
