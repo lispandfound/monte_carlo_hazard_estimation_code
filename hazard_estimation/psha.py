@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 
 import cyclopts
+import flox.xarray
 import geopandas as gpd
 import numba
 import numpy as np
@@ -230,47 +231,61 @@ def estimate_compute(
     return compute_df
 
 
-def run_ground_motion_model(
-    ground_motion_inputs: xr.Dataset, intensity_measure: str, period: float
-) -> xr.Dataset:
-    gmm_inputs = ground_motion_inputs.to_dataframe()
+def process_chunk(ds_chunk, intensity_measure, period):
+    # 1. Stack for GMM library
+    stacked = ds_chunk.stack(sample=ds_chunk.dims)
+    df = stacked.to_dataframe()
+
+    # 2. Run GMM
     gmm_outputs = oqw.run_gmm(
         oqw.constants.GMM.A_22,
         oqw.constants.TectType.ACTIVE_SHALLOW,
-        gmm_inputs,
+        df,
         intensity_measure,
         periods=[period],
     )
-    im_mean = next(column for column in gmm_outputs.columns if column.endswith("_mean"))
-    im_std = next(
-        column for column in gmm_outputs.columns if column.endswith("_std_Total")
-    )
+    # Ensure input matches output
+    gmm_outputs = gmm_outputs.reindex(df.index)
+
+    # Identify columns
+    im_mean = next(c for c in gmm_outputs.columns if c.endswith("_mean"))
+    im_std = next(c for c in gmm_outputs.columns if c.endswith("_std_Total"))
+
+    shape = [ds_chunk.sizes[d] for d in ds_chunk.dims]
+
     return xr.Dataset(
         data_vars={
-            "log_mean": (ground_motion_inputs.dims, gmm_outputs[im_mean].values),
-            "log_stddev": (ground_motion_inputs.dims, gmm_outputs[im_std].values),
+            "log_mean": (ds_chunk.dims, gmm_outputs[im_mean].values.reshape(shape)),
+            "log_stddev": (ds_chunk.dims, gmm_outputs[im_std].values.reshape(shape)),
         },
-        coords=ground_motion_inputs.coords,
+        coords=ds_chunk.coords,
     )
 
 
-@numba.njit(parallel=True, cache=True)
-def _threshold_reduction_optimized(mean, stddev, thresholds):
-    n_sites, n_realisations = mean.shape
-    n_thresh = len(thresholds)
-    occupancy_matrix = np.zeros((n_sites, n_realisations, n_thresh), dtype=np.int64)
+def run_ground_motion_model(
+    ground_motion_inputs: xr.Dataset, intensity_measure: str, period: float
+) -> xr.Dataset:
+    chunked = ground_motion_inputs.chunk("auto")
+    return chunked.map_blocks(
+        functools.partial(
+            process_chunk, intensity_measure=intensity_measure, period=period
+        ),
+    )
 
-    for i in numba.prange(n_sites):
-        for j in range(n_realisations):
-            mu = mean[i, j]
-            sigma = stddev[i, j]
 
-            val = np.random.normal(mu, sigma)
-            idx = np.searchsorted(thresholds, val)
-            for t in range(idx):
-                occupancy_matrix[i, j, t] += 1
+@numba.guvectorize(
+    [(numba.float64, numba.float64, numba.float64[:], numba.int8[:])],
+    "(),(),(t)->(t)",
+    cache=True,
+)
+def _fast_threshold_mask(mu, sigma, thresholds, out):
+    val = np.random.normal(mu, sigma)
 
-    return occupancy_matrix
+    for t in range(thresholds.shape[0]):
+        if val > thresholds[t]:
+            out[t] = 1
+        else:
+            out[t] = 0
 
 
 def monte_carlo_threshold_occupancy(
@@ -283,21 +298,29 @@ def monte_carlo_threshold_occupancy(
     )
 
     counts = xr.apply_ufunc(
-        _threshold_reduction_optimized,
-        ground_motion_observations.log_mean,  # Core dims: ['sites', 'ruptures']
-        ground_motion_observations.log_stddev,  # Core dims: ['sites', 'ruptures']
-        thresholds_da,  # Core dim: ['threshold']
-        input_core_dims=[
-            ["site", "realisation"],
-            ["site", "realisation"],
-            ["threshold"],
-        ],
-        output_core_dims=[["site", "realisation", "threshold"]],
-        vectorize=True,  # This handles the 'n_retries' or other extra dimensions
+        _fast_threshold_mask,
+        ground_motion_observations.log_mean,
+        ground_motion_observations.log_stddev,
+        thresholds_da,
+        input_core_dims=[[], [], ["threshold"]],
+        output_core_dims=[["threshold"]],
         dask="parallelized",
+        output_dtypes=[np.int8],
+    )
+    expected_sites = ground_motion_observations.site.values
+    expected_ruptures = np.unique(ground_motion_observations.rupture.values)
+    poe = flox.xarray.xarray_reduce(
+        counts,
+        "site",
+        "rupture",  # Dimensions to group by
+        func="mean",  # The reduction
+        method="blockwise",  # Force the fast path
+        expected_groups=(
+            expected_sites,
+            expected_ruptures,
+        ),  # Optional: speeds it up by pre-allocating
     )
 
-    poe = counts.groupby(["site", "rupture"]).mean()
     return poe
 
 
@@ -390,7 +413,7 @@ def calculate_analytical_hazard(
 
     gmm_hazards = []
     for period in tqdm.tqdm(periods, unit="period"):
-        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period).unstack()
+        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period)
         hazard = aggregate_analytical_hazard(gmm_outputs, rates, thresholds)
         gmm_hazards.append(hazard)
 
@@ -418,9 +441,10 @@ def calculate_monte_carlo_hazard(
 
     for period in pbar:
         pbar.set_description(f"pSA({period:.2f})")
-        gmm_outputs = run_ground_motion_model(
-            gmm_inputs.stack(sample=gmm_inputs.dims), "pSA", period
-        ).unstack()
+        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period)
+        gmm_outputs = gmm_outputs.chunk(
+            {"site": len(gmm_outputs.site), "realisation": 1000}
+        )
         hazard = aggregate_monte_carlo_hazard(
             gmm_outputs,
             ruptures["rate"].to_xarray(),

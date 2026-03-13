@@ -8,10 +8,11 @@ version = "0.1.0"
 description = "Code for Monte Carlo Hazard Estimation Paper"
 authors = [{ name = "Jake Faulkner" }]
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.13"
 dependencies = [
   "altair<5",
   "cyclopts>=4.5.0",
+  "dask>=2026.1.2",
   "deptry>=0.24.0",
   "flox>=0.11.2",
   "folium>=0.20.0",
