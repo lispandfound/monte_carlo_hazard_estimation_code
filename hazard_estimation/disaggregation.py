@@ -199,42 +199,6 @@ def evaluate_monte_carlo_sample(
     m.save(output_path / "error_map.html")
 
 
-@app.command()
-def evaluate_sampling_strategy(
-    sampling_densities_path: Path,
-    hazard_path: Path,
-    output_path: Path,
-    random: bool = False,
-):
-    with (
-        xr.open_dataset(hazard_path, engine="h5netcdf") as composite_hazard,
-        xr.open_dataset(
-            sampling_densities_path, engine="h5netcdf"
-        ) as sampling_densities,
-    ):
-        total_hazard = composite_hazard.sum("rupture")
-        for site in sampling_densities.site:
-            m = range(len(sampling_densities.period))
-            n = range(len(sampling_densities.rate))
-            bias = np.zeros(sampling_densities.shape, dtype=float)
-            variance = np.zeros_like(bias)
-            ess = np.zeros_like(bias)
-            error_dset = xr.Dataset(
-                dict(
-                    bias=(("rate", "period", "threshold"), bias),
-                    variance=(("rate", "period", "threshold"), variance),
-                    ess=(("rate", "period", "threshold"), ess),
-                ),
-                coords=dict(
-                    rate=sampling_densities.rate, period=sampling_densities.period
-                ),
-            )
-            total_hazard = composite_hazard.sel(site=site).sum("rupture")
-            for i, j in itertools.product(*error_dset.bias.shape):
-                if random:
-                    variance = random_sampling_variance
-
-
 def plot_kl_divergence_period_heatmap(da: xr.DataArray):
     Q = da.isel(period=0)
 
@@ -384,15 +348,9 @@ def multinomial_error(
 def experimental_error(
     experimental_hazard: xr.Dataset, rates: xr.DataArray, hazard: xr.Dataset
 ) -> xr.Dataset:
-    total_experimental_hazard = (
-        experimental_hazard.hazard + experimental_hazard.ds_hazard
-    )
-    lambda_i = hazard.hazard
-    lambda_rup_i = rates
-    total_lambda_rup = lambda_i.sum("rupture")
-
-    total_hazard = total_lambda_rup + hazard.ds_hazard
-    se = np.square(total_experimental_hazard - total_hazard)
+    rupture_hazard = hazard.hazard.sum("rupture")
+    se = np.square(experimental_hazard.hazard - rupture_hazard)
+    breakpoint()
     mse = se.mean("realisation")
     n_realisations = len(experimental_hazard.realisation)
     mse_se = se.std("realisation") / np.sqrt(n_realisations)
@@ -400,6 +358,8 @@ def experimental_error(
     mse_lower = (mse - ci_95).clip(min=0)
     mse_upper = mse + ci_95
 
+    lambda_i = hazard.hazard
+    lambda_rup_i = rates
     p_sigma_sq = (lambda_rup_i * lambda_i) - np.square(lambda_i)
     r = len(lambda_i.rupture)
     constant_numerator = r * p_sigma_sq.sum("rupture")
@@ -409,7 +369,7 @@ def experimental_error(
     ess_upper = xr.where(mse_lower > 0, constant_numerator / mse_lower, np.nan)
     return xr.Dataset(
         dict(
-            hazard=total_hazard,
+            hazard=rupture_hazard,
             mse=mse,
             mse_lower=mse_lower,
             mse_upper=mse_upper,
@@ -422,51 +382,44 @@ def experimental_error(
 
 def plot_empirical_performance_metrics(ds_site):
     # 1. Prepare Data
-    df = ds_site.to_dataframe().reset_index()
 
-    # Calculate Relative RMSE and bounds (%)
-    df["rel_rmse_pct"] = (np.sqrt(df["mse"]) / df["hazard"]) * 100
-    df["rel_rmse_pct_lower"] = (np.sqrt(df["mse_lower"]) / df["hazard"]) * 100
-    df["rel_rmse_pct_upper"] = (np.sqrt(df["mse_upper"]) / df["hazard"]) * 100
-
-    # 2. Setup Figure
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6), sharex=True)
 
-    periods = df["period"].unique()
+    periods = ds_site.period
     palette = sns.color_palette("rocket", n_colors=len(periods))
 
-    # 3. Iterate over periods to plot the mean line and shaded confidence intervals
     for i, p in enumerate(periods):
-        p_data = df[df["period"] == p].sort_values("hazard", ascending=False)
+        period_arr = ds_site.sel(period=p)
+        rmse = np.sqrt(period_arr.mse) / period_arr.hazard * 100
+        rmse_lower = np.sqrt(period_arr.mse_lower) / period_arr.hazard * 100
+        rmse_upper = np.sqrt(period_arr.mse_upper) / period_arr.hazard * 100
+        breakpoint()
         color = palette[i]
-
-        # --- Plot 1: Relative RMSE ---
         ax1.plot(
-            p_data["hazard"],
-            p_data["rel_rmse_pct"],
+            rmse.threshold,
+            rmse,
             color=color,
             alpha=0.9,
             label=f"{p}s",
         )
         ax1.fill_between(
-            p_data["hazard"],
-            p_data["rel_rmse_pct_lower"],
-            p_data["rel_rmse_pct_upper"],
+            rmse.threshold,
+            rmse_lower,
+            rmse_upper,
             color=color,
             alpha=0.15,
             edgecolor="none",
         )
+        ess = period_arr.ess
+        ax2.plot(rmse.threshold, ess, color=color, alpha=0.9, label=f"{p}s")
 
-        # --- Plot 2: ESS ---
-        ax1_line = ax2.plot(
-            p_data["hazard"], p_data["ess"], color=color, alpha=0.9, label=f"{p}s"
-        )
-        # Drop NaNs to prevent matplotlib fill_between artifacts if ess_upper hit infinity
-        valid_ess = p_data.dropna(subset=["ess_lower", "ess_upper"])
+        ess_bounds = period_arr.dropna(["ess_lower", "ess_upper"])
+        ess_lower = ess_bounds.ess_lower
+        ess_upper = ess_bounds.ess_upper
         ax2.fill_between(
-            valid_ess["hazard"],
-            valid_ess["ess_lower"],
-            valid_ess["ess_upper"],
+            ess_bounds.threshold,
+            ess_lower,
+            ess_upper,
             color=color,
             alpha=0.15,
             edgecolor="none",
@@ -493,14 +446,14 @@ def plot_empirical_performance_metrics(ds_site):
         r"Relative Empirical Error ($\sqrt{MSE} / \lambda_{total}$ %)", fontsize=13
     )
     ax1.set_ylabel("Error Percentage (%)")
-    ax1.set_xlabel(r"Total Hazard ($\lambda$)")
+    ax1.set_xlabel(r"Threshold (g)")
     ax1.grid(True, which="both", ls="-", alpha=0.2)
 
     # Ax 2 format
     ax2.set_yscale("log")
     ax2.set_title("Empirical Effective Sample Size (ESS)", fontsize=13)
     ax2.set_ylabel("ESS (Baseline: Equal Allocation)")
-    ax2.set_xlabel(r"Total Hazard ($\lambda$)")
+    ax2.set_xlabel("Threshold (g)")
     ax2.grid(True, which="both", ls="-", alpha=0.2)
 
     # Unified Legend outside the plot

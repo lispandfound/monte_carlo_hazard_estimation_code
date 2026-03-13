@@ -304,7 +304,6 @@ def monte_carlo_threshold_occupancy(
         thresholds_da,
         input_core_dims=[[], [], ["threshold"]],
         output_core_dims=[["threshold"]],
-        dask="parallelized",
         output_dtypes=[np.int8],
     )
     expected_sites = ground_motion_observations.site.values
@@ -312,13 +311,13 @@ def monte_carlo_threshold_occupancy(
     poe = flox.xarray.xarray_reduce(
         counts,
         "site",
-        "rupture",  # Dimensions to group by
-        func="mean",  # The reduction
-        method="blockwise",  # Force the fast path
+        "rupture",
+        func="mean",
+        method="blockwise",
         expected_groups=(
             expected_sites,
             expected_ruptures,
-        ),  # Optional: speeds it up by pre-allocating
+        ),
     )
 
     return poe
@@ -393,6 +392,7 @@ def aggregate_monte_carlo_hazard(
 ) -> xr.DataArray:
     """Multiplies simulated occupancy probability by calculated weights."""
     cond_prob = monte_carlo_threshold_occupancy(gmm_outputs, thresholds)
+
     cond_prob *= rates.sel(rupture=cond_prob.rupture)
     return cond_prob
 
@@ -441,10 +441,7 @@ def calculate_monte_carlo_hazard(
 
     for period in pbar:
         pbar.set_description(f"pSA({period:.2f})")
-        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period)
-        gmm_outputs = gmm_outputs.chunk(
-            {"site": len(gmm_outputs.site), "realisation": 1000}
-        )
+        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period).compute()
         hazard = aggregate_monte_carlo_hazard(
             gmm_outputs,
             ruptures["rate"].to_xarray(),
