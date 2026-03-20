@@ -470,7 +470,7 @@ def calculate_monte_carlo_hazard(
 
     for period in pbar:
         pbar.set_description(f"pSA({period:.2f})")
-        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period).compute()
+        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period)
         hazard = aggregate_monte_carlo_hazard(
             gmm_outputs,
             ruptures["rate"].to_xarray(),
