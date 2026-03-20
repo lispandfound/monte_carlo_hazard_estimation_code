@@ -17,6 +17,7 @@ import shapely
 import tqdm
 import xarray as xr
 from dask.distributed import Client
+from dask_jobqueue import SLURMCluster
 
 Array1 = np.ndarray[tuple[int,], np.dtype[np.float64]]
 Array2 = np.ndarray[tuple[int, int], np.dtype[np.float64]]
@@ -30,6 +31,19 @@ app = cyclopts.App()
 
 STDDEV_UPPER = 1.0
 STDDEV_LOWER = -1.0
+
+# 1. Define what a single SLURM job (one "worker") looks like
+cluster = SLURMCluster(
+    queue="short",  # The partition name on your cluster
+    cores=8,  # CPUs per SLURM job
+    memory="32GB",  # RAM per SLURM job
+    walltime="01:00:00",  # How long each worker should live
+    interface="ib0",  # High-speed interconnect (often 'ib0' or 'eth0')
+)
+
+# 2. Tell SLURM to actually start the workers
+# This sends out 10 sbatch jobs. Total: 80 cores!
+cluster.scale(jobs=10)
 
 
 def get_leonard_magnitude_params(area: Array1, rake: Array1) -> tuple[Array1, Array1]:
@@ -270,8 +284,7 @@ def gmm_worker(
 def run_ground_motion_model(
     ds: xr.Dataset, intensity_measure: str, period: float
 ) -> xr.Dataset:
-    # 1. Chunking
-    chunked = ds.chunk({"z": -1, "site": -1, "rupture": 500})
+    chunked = ds.chunk({"z": -1, "site": -1, "rupture": 100})
 
     # 2. Define the Template
     shape = (chunked.sizes["z"], chunked.sizes["site"], chunked.sizes["rupture"])
