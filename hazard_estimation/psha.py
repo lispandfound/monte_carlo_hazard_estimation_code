@@ -32,19 +32,6 @@ app = cyclopts.App()
 STDDEV_UPPER = 1.0
 STDDEV_LOWER = -1.0
 
-# 1. Define what a single SLURM job (one "worker") looks like
-cluster = SLURMCluster(
-    queue="short",  # The partition name on your cluster
-    cores=8,  # CPUs per SLURM job
-    memory="32GB",  # RAM per SLURM job
-    walltime="01:00:00",  # How long each worker should live
-    interface="ib0",  # High-speed interconnect (often 'ib0' or 'eth0')
-)
-
-# 2. Tell SLURM to actually start the workers
-# This sends out 10 sbatch jobs. Total: 80 cores!
-cluster.scale(jobs=10)
-
 
 def get_leonard_magnitude_params(area: Array1, rake: Array1) -> tuple[Array1, Array1]:
     """Leonard (2014) magnitude scaling parameters.
@@ -621,5 +608,16 @@ def monte_carlo_hazard(
 
 
 if __name__ == "__main__":
-    client = Client()
+    # 1. Define what a single SLURM job (one "worker") looks like
+    cluster = SLURMCluster(
+        cores=8,  # CPUs per SLURM job
+        memory="32GB",  # RAM per SLURM job
+        walltime="01:00:00",  # How long each worker should live
+    )
+
+    # 2. Tell SLURM to actually start the workers
+    # This sends out 10 sbatch jobs. Total: 80 cores!
+    cluster.scale(jobs=10)
+
+    client = Client(cluster)
     app()
