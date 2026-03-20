@@ -176,6 +176,7 @@ def random_sampling_variance(
 @app.command()
 def evaluate_monte_carlo_sample(
     monte_carlo_hazard_path: Path,
+    tag: str,
     ruptures_path: Path,
     site_path: Path,
     hazard_path: Path,
@@ -193,7 +194,7 @@ def evaluate_monte_carlo_sample(
         error = experimental_error(monte_carlo_hazard, rates, composite_hazard)
 
     output_path.mkdir(exist_ok=True, parents=True)
-    plot_site_performance_to(error.sel(site=sites), output_path, empirical=True)
+    plot_site_performance_to(error.sel(site=sites), tag, output_path, empirical=True)
     sites_gdf = gpd.read_parquet(site_path)
     m = spatial_error_map(error, sites_gdf)
     m.save(output_path / "error_map.html")
@@ -348,9 +349,9 @@ def multinomial_error(
 def experimental_error(
     experimental_hazard: xr.Dataset, rates: xr.DataArray, hazard: xr.Dataset
 ) -> xr.Dataset:
+    experimental_hazard, hazard = xr.align(experimental_hazard, hazard, join="inner")
     rupture_hazard = hazard.hazard.sum("rupture")
     se = np.square(experimental_hazard.hazard - rupture_hazard)
-    breakpoint()
     mse = se.mean("realisation")
     n_realisations = len(experimental_hazard.realisation)
     mse_se = se.std("realisation") / np.sqrt(n_realisations)
@@ -367,7 +368,8 @@ def experimental_error(
     ess_lower = constant_numerator / mse_upper
     # Use xr.where to avoid dividing by 0 if mse_lower is exactly 0
     ess_upper = xr.where(mse_lower > 0, constant_numerator / mse_lower, np.nan)
-    return xr.Dataset(
+
+    dset = xr.Dataset(
         dict(
             hazard=rupture_hazard,
             mse=mse,
@@ -378,9 +380,10 @@ def experimental_error(
             ess_upper=ess_upper,
         ),
     )
+    return dset
 
 
-def plot_empirical_performance_metrics(ds_site):
+def plot_empirical_performance_metrics(ds_site, tag: str):
     # 1. Prepare Data
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6), sharex=True)
@@ -388,12 +391,11 @@ def plot_empirical_performance_metrics(ds_site):
     periods = ds_site.period
     palette = sns.color_palette("rocket", n_colors=len(periods))
 
-    for i, p in enumerate(periods):
+    for i, p in enumerate(periods.values):
         period_arr = ds_site.sel(period=p)
         rmse = np.sqrt(period_arr.mse) / period_arr.hazard * 100
         rmse_lower = np.sqrt(period_arr.mse_lower) / period_arr.hazard * 100
         rmse_upper = np.sqrt(period_arr.mse_upper) / period_arr.hazard * 100
-        breakpoint()
         color = palette[i]
         ax1.plot(
             rmse.threshold,
@@ -413,23 +415,16 @@ def plot_empirical_performance_metrics(ds_site):
         ess = period_arr.ess
         ax2.plot(rmse.threshold, ess, color=color, alpha=0.9, label=f"{p}s")
 
-        ess_bounds = period_arr.dropna(["ess_lower", "ess_upper"])
-        ess_lower = ess_bounds.ess_lower
-        ess_upper = ess_bounds.ess_upper
+        ess_lower = period_arr.ess_lower
+        ess_upper = period_arr.ess_upper
         ax2.fill_between(
-            ess_bounds.threshold,
+            period_arr.threshold,
             ess_lower,
             ess_upper,
             color=color,
             alpha=0.15,
             edgecolor="none",
         )
-
-    # 4. Formatting and reference lines
-    rate_2_in_50 = -np.log(1 - 0.02) / 50
-    # Changed to gray dashed to not clash visually with the 'rocket' palette
-    ax1.axvline(x=rate_2_in_50, linestyle="--", c="gray", label="2% in 50yr")
-    ax2.axvline(x=rate_2_in_50, linestyle="--", c="gray", label="2% in 50yr")
 
     if "n" in ds_site.attrs:
         ax2.axhline(
@@ -438,10 +433,10 @@ def plot_empirical_performance_metrics(ds_site):
 
     # Ax 1 format
     ax1.set_ylim(1e-2, 100)
+
     ax1.set_xscale("log")
     ax1.set_yscale("log")
 
-    ax1.invert_xaxis()
     ax1.set_title(
         r"Relative Empirical Error ($\sqrt{MSE} / \lambda_{total}$ %)", fontsize=13
     )
@@ -470,7 +465,9 @@ def plot_empirical_performance_metrics(ds_site):
 
     # Title
     site_name = ds_site.site.values
-    fig.suptitle(f"Monte Carlo Sampling Efficiency Analysis: {site_name}", fontsize=15)
+    fig.suptitle(
+        f"Monte Carlo Sampling Efficiency Analysis: {site_name} ({tag})", fontsize=15
+    )
     fig.tight_layout()
 
     return fig
@@ -506,7 +503,6 @@ def plot_performance_metrics(ds_site):
         ax2.axhline(y=ds_site.attrs["n"], label="Baseline")
     ax1.set_ylim(1e-2, 100)
     ax1.set_xscale("log")
-    ax1.set_yscale("log")
     ax1.invert_xaxis()  # High hazard on left, low on right
     ax1.set_title(r"Relative Error ($\sqrt{MSE} / \lambda_{total}$ %)", fontsize=13)
     ax1.set_ylabel("Error Percentage (%)")
@@ -546,7 +542,7 @@ def spatial_error_map(error: xr.Dataset, sites: gpd.GeoDataFrame) -> folium.Map:
     )
     rmse_at_target = rmse.sel(threshold=threshold_vals, method="nearest")
     sites["rmse"] = rmse_at_target.to_series()
-    return sites.explore("rmse", marker_kwds=dict(radius=10))
+    return sites.explore("rmse", marker_kwds=dict(radius=10), vmin=0, vmax=10)
 
 
 def effective_n(density_dataset, m: int, limit=100000):
@@ -615,13 +611,13 @@ def plot_density_inspection(
 
 
 def plot_site_performance_to(
-    error: xr.Dataset, output: Path, empirical: bool = False
+    error: xr.Dataset, tag: str, output: Path, empirical: bool = False
 ) -> None:
     output_dir = output / "sites"
     output_dir.mkdir(parents=True, exist_ok=True)
     for site in error.site:
         if empirical:
-            fig = plot_empirical_performance_metrics(error.sel(site=site))
+            fig = plot_empirical_performance_metrics(error.sel(site=site), tag)
         else:
             fig = plot_performance_metrics(error.sel(site=site))
         fig.savefig(output_dir / f"{site.item()}.png", dpi=300)

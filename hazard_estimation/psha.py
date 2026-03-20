@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 
 import cyclopts
+import dask.array as da
 import flox.xarray
 import geopandas as gpd
 import numba
@@ -15,6 +16,7 @@ import scipy as sp
 import shapely
 import tqdm
 import xarray as xr
+from dask.distributed import Client
 
 Array1 = np.ndarray[tuple[int,], np.dtype[np.float64]]
 Array2 = np.ndarray[tuple[int, int], np.dtype[np.float64]]
@@ -87,44 +89,40 @@ def analytical_rupture_sample(
     z_lower: float = STDDEV_LOWER,
     z_upper: float = STDDEV_UPPER,
     num: int = 50,
-) -> xr.DataArray:
+) -> xr.Dataset:
     mean_magnitude, sigma = get_leonard_magnitude_params(
         ruptures["area"].values / 1e6, ruptures["rake"]
     )
     z = np.linspace(z_lower, z_upper, num=num)
     magnitude = mean_magnitude[:, None] + z[None, :] * sigma[:, None]
 
-    return xr.DataArray(
+    magnitude_da = xr.DataArray(
         magnitude,
         dims=("rupture", "z"),
         coords=dict(z=z, rupture=ruptures.index.values),
+        name="mag",
+    )
+    return xr.merge(
+        [ruptures.drop(columns=["mag", "geometry"]).to_xarray(), magnitude_da]
     )
 
 
-def rupture_distances(source_to_site: pd.DataFrame) -> xr.DataArray:
-    source_to_site = source_to_site.reset_index().sort_values(["site", "rupture"])
-    n_ruptures = len(source_to_site["rupture"].unique())
-    rrup = source_to_site["rrup"].values
-    sites = source_to_site["site"].unique()
-    ruptures = source_to_site["rupture"].values[:n_ruptures]
-    rrup = rrup.reshape((-1, n_ruptures))
-    return xr.DataArray(
-        rrup, dims=("site", "rupture"), coords=dict(site=sites, rupture=ruptures)
-    )
+def rupture_distances(source_to_site: pd.DataFrame) -> xr.Dataset:
+    return source_to_site.reset_index().set_index(["site", "rupture"]).to_xarray()
 
 
 def ground_motion_inputs(
     rupture_parameters: xr.DataArray,
-    rupture_distances: xr.DataArray,
+    rupture_distances: xr.Dataset,
     sites: pd.DataFrame,
 ) -> xr.Dataset:
-    vs30 = sites["vs30"].to_xarray()
-    return rupture_parameters.assign(
-        vs30=vs30,
-        rrup=rupture_distances.sel(
-            rupture=rupture_parameters.rupture, site=sites.index
-        ),
+    sites_arr = (
+        sites[["vs30", "Z1.0", "Z2.5"]]
+        .to_xarray()
+        .rename({"Z1.0": "z1pt0", "Z2.5": "z2pt5"})
     )
+
+    return xr.merge([rupture_parameters, rupture_distances, sites_arr], join="inner")
 
 
 RRUP_INTERPOLANTS = np.array(
@@ -231,46 +229,77 @@ def estimate_compute(
     return compute_df
 
 
-def process_chunk(ds_chunk, intensity_measure, period):
-    # 1. Stack for GMM library
+def gmm_worker(
+    ds_chunk: xr.Dataset, intensity_measure: str, period: float
+) -> xr.Dataset:
+    """
+    This is your original logic, acting on a single chunk of data.
+    """
+    # 1. Logic: Stack, Convert to DF, Add Metadata
     stacked = ds_chunk.stack(sample=ds_chunk.dims)
     df = stacked.to_dataframe()
 
+    df["vs30measured"] = True
+    df["ztor"] = 0.0
+    df["hypo_depth"] = df["zbot"] / 2.0
+
     # 2. Run GMM
-    gmm_outputs = oqw.run_gmm(
-        oqw.constants.GMM.A_22,
+    gmm_outputs = oqw.run_gmm_logic_tree(
+        oqw.constants.GMMLogicTree.NSHM2022,
         oqw.constants.TectType.ACTIVE_SHALLOW,
         df,
         intensity_measure,
         periods=[period],
     )
-    # Ensure input matches output
-    gmm_outputs = gmm_outputs.reindex(df.index)
 
-    # Identify columns
-    im_mean = next(c for c in gmm_outputs.columns if c.endswith("_mean"))
-    im_std = next(c for c in gmm_outputs.columns if c.endswith("_std_Total"))
+    # 3. Convert back to xarray and identify columns
+    # We use the index from the original 'stacked' to ensure alignment
+    gmm_ds = gmm_outputs.to_xarray()
 
-    shape = [ds_chunk.sizes[d] for d in ds_chunk.dims]
+    variables = list(gmm_ds.data_vars)
+    im_mean = next(c for c in variables if c.endswith("_mean"))
+    im_std = next(c for c in variables if c.endswith("_std_Total"))
 
-    return xr.Dataset(
-        data_vars={
-            "log_mean": (ds_chunk.dims, gmm_outputs[im_mean].values.reshape(shape)),
-            "log_stddev": (ds_chunk.dims, gmm_outputs[im_std].values.reshape(shape)),
-        },
-        coords=ds_chunk.coords,
-    )
+    # 4. Final selection and unstacking back to original dims
+    # We rename and ensure the dimensions match the template (z, site, rupture)
+    res = gmm_ds[[im_mean, im_std]].rename({im_mean: "log_mean", im_std: "log_stddev"})
+
+    return res.transpose("z", "site", "rupture")
 
 
 def run_ground_motion_model(
-    ground_motion_inputs: xr.Dataset, intensity_measure: str, period: float
+    ds: xr.Dataset, intensity_measure: str, period: float
 ) -> xr.Dataset:
-    chunked = ground_motion_inputs.chunk("auto")
-    return chunked.map_blocks(
-        functools.partial(
-            process_chunk, intensity_measure=intensity_measure, period=period
-        ),
+    # 1. Chunking
+    chunked = ds.chunk({"z": -1, "site": -1, "rupture": 500})
+
+    # 2. Define the Template
+    shape = (chunked.sizes["z"], chunked.sizes["site"], chunked.sizes["rupture"])
+
+    # FIX: Convert the xarray chunksizes dict to a positional tuple
+    # This ensures Dask gets ( (15,), (212,), (500, 500, ...) )
+    dask_chunks = tuple(chunked.chunksizes[d] for d in ("z", "site", "rupture"))
+
+    template = xr.Dataset(
+        data_vars={
+            "log_mean": (
+                ("z", "site", "rupture"),
+                da.empty(shape, chunks=dask_chunks, dtype=float),
+            ),
+            "log_stddev": (
+                ("z", "site", "rupture"),
+                da.empty(shape, chunks=dask_chunks, dtype=float),
+            ),
+        },
+        coords=chunked.coords,
     )
+
+    # 3. Parallel Execution
+    return chunked.map_blocks(
+        gmm_worker,
+        kwargs={"intensity_measure": intensity_measure, "period": period},
+        template=template,
+    ).compute()
 
 
 @numba.guvectorize(
@@ -399,7 +428,7 @@ def aggregate_monte_carlo_hazard(
 
 def calculate_analytical_hazard(
     ruptures: pd.DataFrame,
-    source_to_site: pd.DataFrame,
+    source_to_site: xr.Dataset,
     sites: pd.DataFrame,
     periods: Array1,
     thresholds: Array1,
@@ -407,8 +436,8 @@ def calculate_analytical_hazard(
 ) -> xr.DataArray:
     """End-to-end Python API for analytical hazard."""
     realisations = analytical_rupture_sample(ruptures, STDDEV_LOWER, STDDEV_UPPER, n)
-    rrup = rupture_distances(source_to_site).sel(site=sites.index.values)
-    gmm_inputs = ground_motion_inputs(realisations, rrup, sites)
+
+    gmm_inputs = ground_motion_inputs(realisations, source_to_site, sites)
     rates = ruptures["rate"].to_xarray()
 
     gmm_hazards = []
@@ -476,7 +505,7 @@ def load_hazard_inputs(
     ruptures_path: Path, source_to_site_path: Path, sites_path: Path
 ):
     ruptures = pd.read_parquet(ruptures_path).rename_axis("rupture")
-    source_to_site = pd.read_parquet(source_to_site_path).rename_axis("rupture")
+    source_to_site = xr.open_dataset(source_to_site_path, engine="h5netcdf")
     sites = gpd.read_parquet(sites_path).rename_axis("site")
     return ruptures, source_to_site, sites
 
@@ -579,4 +608,5 @@ def monte_carlo_hazard(
 
 
 if __name__ == "__main__":
+    client = Client()
     app()

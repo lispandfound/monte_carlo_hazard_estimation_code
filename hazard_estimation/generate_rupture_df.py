@@ -1,5 +1,6 @@
 """Pre-compute rupture dataframes for a given site."""
 
+import dataclasses
 from functools import partial
 from pathlib import Path
 from typing import TypedDict
@@ -11,11 +12,20 @@ import pandas as pd
 import shapely
 import tqdm
 from nshmdb.nshmdb import NSHMDB, FaultInfo, Rupture
+from source_modelling import sources
 from tqdm.contrib.concurrent import process_map
 
-from hazard_estimation.site import Site
-
 app = cyclopts.App()
+
+
+@dataclasses.dataclass
+class Site:
+    lat: float
+    lon: float
+    name: str
+    vs30: float
+    z1pt0: float
+    z2pt5: float
 
 
 def get_rupture_ids(db: NSHMDB) -> set[int]:
@@ -114,19 +124,24 @@ def measure_site_distance(rupture: Rupture, site: Site) -> float:
 class RuptureRow(TypedDict):
     """Data transfer object for ruptures into DataFrame."""
 
-    rupture_id: int
+    rupture: int
     mag: float
     area: float
     rake: float
+    dip: float
     rate: float
+    zbot: float
 
 
 class SiteRow(TypedDict):
     """Data transfer object for ruptures into DataFrame."""
 
-    rupture_id: int
+    rupture: int
     site: str
     rrup: float
+    rx: float
+    ry: float
+    rjb: float
 
 
 def _process_single_rupture(rupture: Rupture, sites: list[Site]) -> list[SiteRow]:
@@ -134,12 +149,27 @@ def _process_single_rupture(rupture: Rupture, sites: list[Site]) -> list[SiteRow
     rows = []
     for site in sites:
         # Calculate minimum rrup across all faults for this site
+        faults = list(rupture.faults.values())
         rrup = min(
-            fault.rrup_distance(np.array([site.lat, site.lon, 0.0]))
-            for fault in rupture.faults.values()
+            fault.rrup_distance(np.array([site.lat, site.lon, 0.0])) for fault in faults
         )
         rrup /= 1000.0  # Convert to km
-        rows.append(SiteRow(rupture_id=rupture.rupture_id, site=site.name, rrup=rrup))
+        rx, ry = sources.multi_fault_rx_ry_distance(
+            faults, np.array([[site.lat, site.lon, 0.0]])
+        )
+        rjb = min(
+            fault.rjb_distance(np.array([site.lat, site.lon, 0.0])) for fault in faults
+        )
+        rows.append(
+            SiteRow(
+                rupture=rupture.rupture_id,
+                site=site.name,
+                rrup=rrup,
+                rx=rx.item(),
+                ry=ry.item(),
+                rjb=rjb,
+            )
+        )
     return rows
 
 
@@ -156,7 +186,7 @@ def compile_source_to_site_dataframe(nshmdb: NSHMDB, sites: list[Site]) -> pd.Da
     # Flatten the list of lists into a single list of SiteRow objects
     flattened_rows = [row for sublist in results for row in sublist]
 
-    return pd.DataFrame(flattened_rows).set_index("rupture_id")
+    return pd.DataFrame(flattened_rows).set_index("rupture")
 
 
 def compile_rupture_dataframe(nshmdb: NSHMDB) -> gpd.GeoDataFrame:
@@ -166,6 +196,8 @@ def compile_rupture_dataframe(nshmdb: NSHMDB) -> gpd.GeoDataFrame:
     geometries = []
     for rupture in ruptures:
         rakes = [fault_info[fault].rake for fault in rupture.faults]
+        dips = [fault.dip for fault in rupture.faults.values()]
+        bottoms = [fault.bottom_m / 1000 for fault in rupture.faults.values()]
         areas = [fault.area() for fault in rupture.faults.values()]
         rad_rakes = np.deg2rad(rakes)
         cos_rake = np.cos(rad_rakes)
@@ -173,22 +205,25 @@ def compile_rupture_dataframe(nshmdb: NSHMDB) -> gpd.GeoDataFrame:
         mean_rake_vec = np.average(
             np.array([cos_rake, sin_rake]), axis=-1, weights=areas
         )
+        # Because dip does not wrap around, a straight-forward mean is ok.
+        mean_dip = np.average(dips, axis=-1, weights=areas)
         mean_rake = np.rad2deg(np.arctan2(mean_rake_vec[1], mean_rake_vec[0]))
+        mean_bottom = np.average(bottoms, weights=areas)
         geometries.append(
             shapely.union_all([fault.geometry for fault in rupture.faults.values()])
         )
         rows.append(
             RuptureRow(
-                rupture_id=rupture.rupture_id,
+                rupture=rupture.rupture_id,
                 mag=rupture.magnitude,
                 area=rupture.area,
                 rake=mean_rake,
+                dip=mean_dip,
                 rate=rupture.rate,
+                zbot=mean_bottom,
             )
         )
-    return gpd.GeoDataFrame(rows, geometry=geometries, crs="2193").set_index(
-        "rupture_id"
-    )
+    return gpd.GeoDataFrame(rows, geometry=geometries, crs="2193").set_index("rupture")
 
 
 @app.command
@@ -197,7 +232,12 @@ def source_to_site(nshmdb_path: Path, site_path: Path, output_path: Path):
     site_df = gpd.read_parquet(site_path).to_crs(4326)
     sites = [
         Site(
-            name=name, vs30=prop["vs30"], lat=prop["geometry"].y, lon=prop["geometry"].x
+            name=name,
+            vs30=prop["vs30"],
+            z1pt0=prop["z1pt0"],
+            z2pt5=prop["z2pt5"],
+            lat=prop["geometry"].y,
+            lon=prop["geometry"].x,
         )
         for name, prop in site_df.iterrows()
     ]
