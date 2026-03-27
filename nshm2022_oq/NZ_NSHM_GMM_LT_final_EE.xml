@@ -37,7 +37,7 @@
                   epistemic = "Central"
                   modified_sigma = "true"
                   </uncertaintyModel>
-                        <uncertaintyWeight>0.084</uncertaintyWeight>
+                        <uncertaintyWeight>0.112</uncertaintyWeight>
                     </logicTreeBranch>
 
                     <logicTreeBranch branchID="ATK22_crust_lower">

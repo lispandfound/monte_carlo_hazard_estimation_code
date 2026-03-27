@@ -1,0 +1,87 @@
+<?xml version='1.0' encoding='utf-8'?>
+<nrml xmlns="http://openquake.org/xmlns/nrml/0.5">
+    <logicTree>
+      <!-- <logicTreeBranchSet uncertaintyType="sourceModel" branchSetID="SLAB"> -->
+        <!-- <logicTreeBranch branchID="slab-uniform-1depth-rates_combined"> -->
+          <!-- <uncertaintyModel>source_definitions/RmlsZToxMjEwMzM=/slab-uniform-1depth-rates.xml </uncertaintyModel> -->
+          <!-- <uncertaintyWeight>1.0000000000</uncertaintyWeight> -->
+        <!-- </logicTreeBranch> -->
+      <!-- </logicTreeBranchSet> -->
+      <!-- <logicTreeBranchSet uncertaintyType="extendModel" branchSetID="Hik"> -->
+        <!-- <logicTreeBranch branchID="Hik TL, N16pt5, b0pt95, C4, s0pt42_combined"> -->
+          <!-- <uncertaintyModel>source_definitions/RmlsZToxMzA3MzI=/npFloor_MULTOT1346GruEEPAScomb-INT_hiktlck_b0.95_N0.27.xml source_definitions/RmlsZToxMzA3NTM=/npFloor_MULTOT1346GruEEPAScomb-INT_puy_b0.90_N0.73.xml </uncertaintyModel> -->
+          <!-- <uncertaintyWeight>0.1472166372</uncertaintyWeight> -->
+        <!-- </logicTreeBranch> -->
+        <!-- <logicTreeBranch branchID="Hik TL, N16pt5, b0pt95, C4, s1_combined"> -->
+          <!-- <uncertaintyModel>source_definitions/RmlsZToxMzA3MzQ=/npFloor_MULTOT1346GruEEPAScomb-INT_hiktlck_b0.95_N0.64.xml source_definitions/RmlsZToxMzA3NTQ=/npFloor_MULTOT1346GruEEPAScomb-INT_puy_b0.90_N2.60.xml </uncertaintyModel> -->
+          <!-- <uncertaintyWeight>0.2811549111</uncertaintyWeight> -->
+        <!-- </logicTreeBranch> -->
+        <!-- <logicTreeBranch branchID="Hik TL, N16pt5, b0pt95, C4, s1pt58_combined"> -->
+          <!-- <uncertaintyModel>source_definitions/RmlsZToxMzA3MzY=/npFloor_MULTOT1346GruEEPAScomb-INT_hiktlck_b0.95_N1.01.xml source_definitions/RmlsZToxMzA3NTU=/npFloor_MULTOT1346GruEEPAScomb-INT_puy_b0.90_N4.47.xml </uncertaintyModel> -->
+          <!-- <uncertaintyWeight>0.1483712775</uncertaintyWeight> -->
+        <!-- </logicTreeBranch> -->
+        <!-- <logicTreeBranch branchID="Hik TL, N21pt5, b1pt097, C4, s0pt42_combined"> -->
+          <!-- <uncertaintyModel>source_definitions/RmlsZToxMzA3Mzg=/npFloor_MULTOT1346GruEEPAScomb-INT_hiktlck_b1.10_N0.35.xml source_definitions/RmlsZToxMzA3NTM=/npFloor_MULTOT1346GruEEPAScomb-INT_puy_b0.90_N0.73.xml </uncertaintyModel> -->
+          <!-- <uncertaintyWeight>0.0887399957</uncertaintyWeight> -->
+        <!-- </logicTreeBranch> -->
+        <!-- <logicTreeBranch branchID="Hik TL, N21pt5, b1pt097, C4, s1_combined"> -->
+          <!-- <uncertaintyModel>source_definitions/RmlsZToxMzA3NDA=/npFloor_MULTOT1346GruEEPAScomb-INT_hiktlck_b1.10_N0.83.xml source_definitions/RmlsZToxMzA3NTQ=/npFloor_MULTOT1346GruEEPAScomb-INT_puy_b0.90_N2.60.xml </uncertaintyModel> -->
+          <!-- <uncertaintyWeight>0.1694759917</uncertaintyWeight> -->
+        <!-- </logicTreeBranch> -->
+        <!-- <logicTreeBranch branchID="Hik TL, N21pt5, b1pt097, C4, s1pt58_combined"> -->
+          <!-- <uncertaintyModel>source_definitions/RmlsZToxMzA3NDI=/npFloor_MULTOT1346GruEEPAScomb-INT_hiktlck_b1.10_N1.31.xml source_definitions/RmlsZToxMzA3NTU=/npFloor_MULTOT1346GruEEPAScomb-INT_puy_b0.90_N4.47.xml </uncertaintyModel> -->
+          <!-- <uncertaintyWeight>0.0894359956</uncertaintyWeight> -->
+        <!-- </logicTreeBranch> -->
+        <!-- <logicTreeBranch branchID="Hik TL, N27pt9, b1pt241, C4, s0pt42_combined"> -->
+          <!-- <uncertaintyModel>source_definitions/RmlsZToxMzA3NDQ=/npFloor_MULTOT1346GruEEPAScomb-INT_hiktlck_b1.24_N0.46.xml source_definitions/RmlsZToxMzA3NTM=/npFloor_MULTOT1346GruEEPAScomb-INT_puy_b0.90_N0.73.xml </uncertaintyModel> -->
+          <!-- <uncertaintyWeight>0.0192986224</uncertaintyWeight> -->
+        <!-- </logicTreeBranch> -->
+        <!-- <logicTreeBranch branchID="Hik TL, N27pt9, b1pt241, C4, s1_combined"> -->
+          <!-- <uncertaintyModel>source_definitions/RmlsZToxMzA3NDY=/npFloor_MULTOT1346GruEEPAScomb-INT_hiktlck_b1.24_N1.09.xml source_definitions/RmlsZToxMzA3NTQ=/npFloor_MULTOT1346GruEEPAScomb-INT_puy_b0.90_N2.60.xml </uncertaintyModel> -->
+          <!-- <uncertaintyWeight>0.0368565847</uncertaintyWeight> -->
+        <!-- </logicTreeBranch> -->
+        <!-- <logicTreeBranch branchID="Hik TL, N27pt9, b1pt241, C4, s1pt58_combined"> -->
+          <!-- <uncertaintyModel>source_definitions/RmlsZToxMzA3NDg=/npFloor_MULTOT1346GruEEPAScomb-INT_hiktlck_b1.24_N1.72.xml source_definitions/RmlsZToxMzA3NTU=/npFloor_MULTOT1346GruEEPAScomb-INT_puy_b0.90_N4.47.xml </uncertaintyModel> -->
+          <!-- <uncertaintyWeight>0.0194499841</uncertaintyWeight> -->
+        <!-- </logicTreeBranch> -->
+      <!-- </logicTreeBranchSet> -->
+      <logicTreeBranchSet uncertaintyType="sourceModel" branchSetID="CRU">
+        <logicTreeBranch branchID="geodetic, TI, N2pt7, b0pt823 C4pt2 s0pt66_combined">
+          <uncertaintyModel>source_definitions/RmlsZToxMzA3MDc=/npFloor_MULTOT1346GruEEPAScomb-CRU_plyadj_ratestapered_b0.82_N2.57.xml </uncertaintyModel>
+          <uncertaintyWeight>0.0809791240</uncertaintyWeight>
+        </logicTreeBranch>
+        <logicTreeBranch branchID="geodetic, TI, N2pt7, b0pt823 C4pt2 s1_combined">
+          <uncertaintyModel>source_definitions/RmlsZToxMzA3MTA=/npFloor_MULTOT1346GruEEPAScomb-CRU_plyadj_ratestapered_b0.82_N3.90.xml </uncertaintyModel>
+          <uncertaintyWeight>0.1967181549</uncertaintyWeight>
+        </logicTreeBranch>
+        <logicTreeBranch branchID="geodetic, TI, N2pt7, b0pt823 C4pt2 s1pt41_combined">
+          <uncertaintyModel>source_definitions/RmlsZToxMzA3MTM=/npFloor_MULTOT1346GruEEPAScomb-CRU_plyadj_ratestapered_b0.82_N5.50.xml </uncertaintyModel>
+          <uncertaintyWeight>0.1042797210</uncertaintyWeight>
+        </logicTreeBranch>
+        <logicTreeBranch branchID="geodetic, TI, N3pt4, b0pt959 C4pt2 s0pt66_combined">
+          <uncertaintyModel>source_definitions/RmlsZToxMzA3MTY=/npFloor_MULTOT1346GruEEPAScomb-CRU_plyadj_ratestapered_b0.96_N3.17.xml </uncertaintyModel>
+          <uncertaintyWeight>0.1107193331</uncertaintyWeight>
+        </logicTreeBranch>
+        <logicTreeBranch branchID="geodetic, TI, N3pt4, b0pt959 C4pt2 s1_combined">
+          <uncertaintyModel>source_definitions/RmlsZToxMzA3MTk=/npFloor_MULTOT1346GruEEPAScomb-CRU_plyadj_ratestapered_b0.96_N4.80.xml </uncertaintyModel>
+          <uncertaintyWeight>0.2689644176</uncertaintyWeight>
+        </logicTreeBranch>
+        <logicTreeBranch branchID="geodetic, TI, N3pt4, b0pt959 C4pt2 s1pt41_combined">
+          <uncertaintyModel>source_definitions/RmlsZToxMzA3MjI=/npFloor_MULTOT1346GruEEPAScomb-CRU_plyadj_ratestapered_b0.96_N6.77.xml </uncertaintyModel>
+          <uncertaintyWeight>0.1425772544</uncertaintyWeight>
+        </logicTreeBranch>
+        <logicTreeBranch branchID="geodetic, TI, N4pt6, b1pt089 C4pt2 s0pt66_combined">
+          <uncertaintyModel>source_definitions/RmlsZToxMzA3MjU=/npFloor_MULTOT1346GruEEPAScomb-CRU_plyadj_ratestapered_b1.09_N4.22.xml </uncertaintyModel>
+          <uncertaintyWeight>0.0203015430</uncertaintyWeight>
+        </logicTreeBranch>
+        <logicTreeBranch branchID="geodetic, TI, N4pt6, b1pt089 C4pt2 s1_combined">
+          <uncertaintyModel>source_definitions/RmlsZToxMzA3Mjg=/npFloor_MULTOT1346GruEEPAScomb-CRU_plyadj_ratestapered_b1.09_N6.40.xml </uncertaintyModel>
+          <uncertaintyWeight>0.0493174275</uncertaintyWeight>
+        </logicTreeBranch>
+        <logicTreeBranch branchID="geodetic, TI, N4pt6, b1pt089 C4pt2 s1pt41_combined">
+          <uncertaintyModel>source_definitions/RmlsZToxMzA3MzE=/npFloor_MULTOT1346GruEEPAScomb-CRU_plyadj_ratestapered_b1.09_N9.02.xml </uncertaintyModel>
+          <uncertaintyWeight>0.0261430247</uncertaintyWeight>
+        </logicTreeBranch>
+        </logicTreeBranchSet>
+    </logicTree>
+  </nrml>
