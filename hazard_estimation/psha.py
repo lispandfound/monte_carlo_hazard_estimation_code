@@ -1,5 +1,7 @@
 """Analytically integrate PSHA to obtain a hazard curve"""
 
+from distributed import Client
+
 import functools
 import math
 from pathlib import Path
@@ -568,6 +570,8 @@ def monte_carlo_hazard(
     seed: int | None = None,
     column: str = "kl_density",
 ) -> None:
+    client = Client()
+    print(f"Dashboard at {client.dashboard_link}")
     ruptures, source_to_site, sites = load_hazard_inputs(
         ruptures_path, source_to_site_path, sites_path
     )
