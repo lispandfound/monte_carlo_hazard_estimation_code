@@ -16,8 +16,6 @@ import scipy as sp
 import shapely
 import tqdm
 import xarray as xr
-from dask.distributed import Client
-from dask_jobqueue import SLURMCluster
 
 Array1 = np.ndarray[tuple[int,], np.dtype[np.float64]]
 Array2 = np.ndarray[tuple[int, int], np.dtype[np.float64]]
@@ -231,7 +229,7 @@ def estimate_compute(
 
 
 def gmm_worker(
-    ds_chunk: xr.Dataset, intensity_measure: str, period: float
+    ds_chunk: xr.Dataset, intensity_measure: str, period: float, logic_tree: bool
 ) -> xr.Dataset:
     """
     This is your original logic, acting on a single chunk of data.
@@ -244,40 +242,40 @@ def gmm_worker(
     df["ztor"] = 0.0
     df["hypo_depth"] = df["zbot"] / 2.0
 
-    # 2. Run GMM
-    gmm_outputs = oqw.run_gmm_logic_tree(
-        oqw.constants.GMMLogicTree.NSHM2022,
-        oqw.constants.TectType.ACTIVE_SHALLOW,
-        df,
-        intensity_measure,
-        periods=[period],
-    )
+    if logic_tree:
+        gmm_outputs = oqw.run_gmm_logic_tree(
+            oqw.constants.GMMLogicTree.NSHM2022,
+            oqw.constants.TectType.ACTIVE_SHALLOW,
+            df,
+            intensity_measure,
+            periods=[period],
+        )
+    else:
+        gmm_outputs = oqw.run_gmm(
+            oqw.constants.GMM.A_22,
+            oqw.constants.TectType.ACTIVE_SHALLOW,
+            df,
+            intensity_measure,
+            periods=[period],
+        )
 
-    # 3. Convert back to xarray and identify columns
-    # We use the index from the original 'stacked' to ensure alignment
     gmm_ds = gmm_outputs.to_xarray()
 
     variables = list(gmm_ds.data_vars)
     im_mean = next(c for c in variables if c.endswith("_mean"))
     im_std = next(c for c in variables if c.endswith("_std_Total"))
 
-    # 4. Final selection and unstacking back to original dims
-    # We rename and ensure the dimensions match the template (z, site, rupture)
     res = gmm_ds[[im_mean, im_std]].rename({im_mean: "log_mean", im_std: "log_stddev"})
 
     return res.transpose("z", "site", "rupture")
 
 
 def run_ground_motion_model(
-    ds: xr.Dataset, intensity_measure: str, period: float
+    ds: xr.Dataset, intensity_measure: str, period: float, logic_tree: bool
 ) -> xr.Dataset:
     chunked = ds.chunk({"z": -1, "site": -1, "rupture": 100})
 
-    # 2. Define the Template
     shape = (chunked.sizes["z"], chunked.sizes["site"], chunked.sizes["rupture"])
-
-    # FIX: Convert the xarray chunksizes dict to a positional tuple
-    # This ensures Dask gets ( (15,), (212,), (500, 500, ...) )
     dask_chunks = tuple(chunked.chunksizes[d] for d in ("z", "site", "rupture"))
 
     template = xr.Dataset(
@@ -294,10 +292,13 @@ def run_ground_motion_model(
         coords=chunked.coords,
     )
 
-    # 3. Parallel Execution
     return chunked.map_blocks(
         gmm_worker,
-        kwargs={"intensity_measure": intensity_measure, "period": period},
+        kwargs={
+            "intensity_measure": intensity_measure,
+            "period": period,
+            "logic_tree": logic_tree,
+        },
         template=template,
     ).compute()
 
@@ -321,7 +322,6 @@ def monte_carlo_threshold_occupancy(
     ground_motion_observations: xr.Dataset,
     thresholds: Array1,
 ) -> xr.DataArray:
-
     thresholds_da = xr.DataArray(
         np.log(thresholds), dims=["threshold"], coords={"threshold": thresholds}
     )
@@ -433,6 +433,7 @@ def calculate_analytical_hazard(
     periods: Array1,
     thresholds: Array1,
     n: int,
+    logic_tree: bool,
 ) -> xr.DataArray:
     """End-to-end Python API for analytical hazard."""
     realisations = analytical_rupture_sample(ruptures, STDDEV_LOWER, STDDEV_UPPER, n)
@@ -442,7 +443,7 @@ def calculate_analytical_hazard(
 
     gmm_hazards = []
     for period in tqdm.tqdm(periods, unit="period"):
-        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period)
+        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period, logic_tree)
         hazard = aggregate_analytical_hazard(gmm_outputs, rates, thresholds)
         gmm_hazards.append(hazard)
 
@@ -533,6 +534,7 @@ def hazard(
     gmm_hazard_path: Path,
     periods: list[float] | None = None,
     thresholds: list[float] | None = None,
+    logic_tree: bool = False,
 ) -> None:
     ruptures, source_to_site, sites = load_hazard_inputs(
         ruptures_path, source_to_site_path, sites_path
@@ -541,7 +543,7 @@ def hazard(
     thresholds_arr = np.asarray(thresholds) if thresholds else THRESHOLDS
 
     rupture_hazard = calculate_analytical_hazard(
-        ruptures, source_to_site, sites, periods_arr, thresholds_arr, n
+        ruptures, source_to_site, sites, periods_arr, thresholds_arr, n, logic_tree
     )
 
     ds_hazard = compute_distributed_hazard(
@@ -608,16 +610,4 @@ def monte_carlo_hazard(
 
 
 if __name__ == "__main__":
-    # 1. Define what a single SLURM job (one "worker") looks like
-    cluster = SLURMCluster(
-        cores=8,  # CPUs per SLURM job
-        memory="32GB",  # RAM per SLURM job
-        walltime="01:00:00",  # How long each worker should live
-    )
-
-    # 2. Tell SLURM to actually start the workers
-    # This sends out 10 sbatch jobs. Total: 80 cores!
-    cluster.scale(jobs=10)
-
-    client = Client(cluster)
     app()
