@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<nrml xmlns:gml="http://www.opengis.net/gml"
+      xmlns="http://openquake.org/xmlns/nrml/0.4">
+    <logicTree logicTreeID='lt1'>
+            <logicTreeBranchSet uncertaintyType="gmpeModel" branchSetID="bs_crust"
+                    applyToTectonicRegionType="Active Shallow Crust">
+
+                    <logicTreeBranch branchID="ATK22_crust_center">
+                <uncertaintyModel>[Atkinson2022Crust]
+                  epistemic = "Central"
+                  modified_sigma = "true"
+                  </uncertaintyModel>
+                  <uncertaintyWeight>1.0</uncertaintyWeight>
+                    </logicTreeBranch>
+
+            </logicTreeBranchSet>
+    </logicTree>
+</nrml>
