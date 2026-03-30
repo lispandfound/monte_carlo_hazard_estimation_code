@@ -293,7 +293,7 @@ def run_ground_motion_model(
         },
         coords=chunked.coords,
     )
-    print(f'Running GMM with {"logic tree" if logic_tree else "A22 model"}.')
+    print(f"Running GMM with {'logic tree' if logic_tree else 'A22 model'}.")
     return chunked.map_blocks(
         gmm_worker,
         kwargs={
@@ -454,26 +454,26 @@ def calculate_analytical_hazard(
 
 def calculate_monte_carlo_hazard(
     ruptures: pd.DataFrame,
-    source_to_site: pd.DataFrame,
+    distances: xr.Dataset,
     sites: pd.DataFrame,
     periods: Array1,
     thresholds: Array1,
     n: int,
     column: str,
     seed: int | None,
+    logic_tree: bool = False,
 ) -> xr.DataArray:
     """End-to-end Python API for monte carlo hazard."""
     count = np.round(n * ruptures[column] / ruptures[column].sum()).astype(int)
     realisations = monte_carlo_sample(ruptures, count, STDDEV_LOWER, STDDEV_UPPER)
-    rrup = rupture_distances(source_to_site).sel(site=sites.index.values)
-    gmm_inputs = ground_motion_inputs(realisations, rrup, sites)
+    gmm_inputs = ground_motion_inputs(realisations, distances, sites)
     np.random.seed(seed=seed)
     hazards = []
     pbar = tqdm.tqdm(periods, unit="period", position=1, leave=False)
 
     for period in pbar:
         pbar.set_description(f"pSA({period:.2f})")
-        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period)
+        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period, logic_tree)
         hazard = aggregate_monte_carlo_hazard(
             gmm_outputs,
             ruptures["rate"].to_xarray(),
