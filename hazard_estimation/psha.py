@@ -293,7 +293,7 @@ def run_ground_motion_model(
         },
         coords=chunked.coords,
     )
-
+    print(f'Running GMM with {"logic tree" if logic_tree else "A22 model"}.')
     return chunked.map_blocks(
         gmm_worker,
         kwargs={
