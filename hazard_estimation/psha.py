@@ -268,27 +268,32 @@ def gmm_worker(
     im_std = next(c for c in variables if c.endswith("_std_Total"))
 
     res = gmm_ds[[im_mean, im_std]].rename({im_mean: "log_mean", im_std: "log_stddev"})
-
-    return res.transpose("z", "site", "rupture")
+    assert isinstance(res, xr.Dataset)
+    core_dims = ["site", "rupture"]
+    others = [c for c in sorted(gmm_ds.dims) if c not in core_dims]
+    dim_order = others + core_dims
+    return res.transpose(*dim_order, missing_dims="warn")
 
 
 def run_ground_motion_model(
     ds: xr.Dataset, intensity_measure: str, period: float, logic_tree: bool
 ) -> xr.Dataset:
     print(ds)
-    chunked = ds.chunk({'rupture': 1000})
-
-    shape = (chunked.sizes["z"], chunked.sizes["site"], chunked.sizes["rupture"])
-    dask_chunks = tuple(chunked.chunksizes[d] for d in ("z", "site", "rupture"))
+    chunked = ds.chunk({"rupture": 1000})
+    core_dims = ["site", "rupture"]
+    others = [c for c in sorted(chunked.dims) if c not in core_dims]
+    dim_order = others + core_dims
+    shape = tuple(chunked.sizes[d] for d in dim_order)
+    dask_chunks = tuple(chunked.chunksizes[d] for d in dim_order)
 
     template = xr.Dataset(
         data_vars={
             "log_mean": (
-                ("z", "site", "rupture"),
+                dim_order,
                 da.empty(shape, chunks=dask_chunks, dtype=float),
             ),
             "log_stddev": (
-                ("z", "site", "rupture"),
+                dim_order,
                 da.empty(shape, chunks=dask_chunks, dtype=float),
             ),
         },
