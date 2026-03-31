@@ -275,7 +275,8 @@ def gmm_worker(
 def run_ground_motion_model(
     ds: xr.Dataset, intensity_measure: str, period: float, logic_tree: bool
 ) -> xr.Dataset:
-    chunked = ds.chunk({"z": -1, "site": -1, "rupture": 100})
+    print(ds)
+    chunked = ds.chunk({'rupture': 1000})
 
     shape = (chunked.sizes["z"], chunked.sizes["site"], chunked.sizes["rupture"])
     dask_chunks = tuple(chunked.chunksizes[d] for d in ("z", "site", "rupture"))
@@ -293,7 +294,6 @@ def run_ground_motion_model(
         },
         coords=chunked.coords,
     )
-    print(f"Running GMM with {'logic tree' if logic_tree else 'A22 model'}.")
     return chunked.map_blocks(
         gmm_worker,
         kwargs={
