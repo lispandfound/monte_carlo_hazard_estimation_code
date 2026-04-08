@@ -7,7 +7,6 @@ import math
 from pathlib import Path
 
 import cyclopts
-import dask.array as da
 import flox.xarray
 import geopandas as gpd
 import numba
