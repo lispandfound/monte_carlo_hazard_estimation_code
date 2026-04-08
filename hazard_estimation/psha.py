@@ -73,16 +73,10 @@ def monte_carlo_sample(
     magnitudes = sp.stats.truncnorm.rvs(
         z_lower, z_upper, loc=mean_magnitude, scale=sigma
     )
-    return xr.Dataset(
-        dict(
-            mag=("realisation", magnitudes),
-            rates=("realisation", rates),
-        ),
-        coords=dict(
-            realisation=np.arange(len(sample)),
-            rupture=("realisation", sample.index.values),
-        ),
-    )
+    sample['mag'] = magnitudes
+    dset = sample[['rake', 'area', 'mag', 'zbot', 'dip']].reset_index().rename_axis('sample').to_xarray()
+    dset = dset.set_coords('rupture')
+    return dset
 
 
 def analytical_rupture_sample(
@@ -122,8 +116,8 @@ def ground_motion_inputs(
         .to_xarray()
         .rename({"Z1.0": "z1pt0", "Z2.5": "z2pt5"})
     )
-
-    return xr.merge([rupture_parameters, rupture_distances, sites_arr], join="inner")
+    rupture_distances = rupture_distances.sel(rupture=rupture_parameters.rupture)
+    return xr.merge([rupture_parameters, rupture_distances, sites_arr], join="inner", compat='no_conflicts')
 
 
 RRUP_INTERPOLANTS = np.array(
@@ -230,20 +224,18 @@ def estimate_compute(
     return compute_df
 
 
+
 def gmm_worker(
     ds_chunk: xr.Dataset, intensity_measure: str, period: float, logic_tree: bool
 ) -> xr.Dataset:
     """
     This is your original logic, acting on a single chunk of data.
     """
-    # 1. Logic: Stack, Convert to DF, Add Metadata
-    stacked = ds_chunk.stack(sample=ds_chunk.dims)
+    stacked = ds_chunk.stack(coord=ds_chunk.dims)
     df = stacked.to_dataframe()
-
     df["vs30measured"] = True
     df["ztor"] = 0.0
     df["hypo_depth"] = df["zbot"] / 2.0
-
     if logic_tree:
         gmm_outputs = oqw.run_gmm_logic_tree(
             oqw.constants.GMMLogicTree.NSHM2022,
@@ -260,44 +252,17 @@ def gmm_worker(
             intensity_measure,
             periods=[period],
         )
-
-    gmm_ds = gmm_outputs.to_xarray()
-
+    gmm_ds = xr.merge((gmm_outputs.to_xarray(), ds_chunk))
     variables = list(gmm_ds.data_vars)
     im_mean = next(c for c in variables if c.endswith("_mean"))
     im_std = next(c for c in variables if c.endswith("_std_Total"))
-
     res = gmm_ds[[im_mean, im_std]].rename({im_mean: "log_mean", im_std: "log_stddev"})
-    assert isinstance(res, xr.Dataset)
-    core_dims = ["site", "rupture"]
-    others = [c for c in sorted(gmm_ds.dims) if c not in core_dims]
-    dim_order = others + core_dims
-    return res.transpose(*dim_order, missing_dims="warn")
-
+    return res
 
 def run_ground_motion_model(
     ds: xr.Dataset, intensity_measure: str, period: float, logic_tree: bool
 ) -> xr.Dataset:
-    chunked = ds.chunk({"rupture": 100})
-    core_dims = ["site", "rupture"]
-    others = [c for c in sorted(chunked.dims) if c not in core_dims]
-    dim_order = others + core_dims
-    shape = tuple(chunked.sizes[d] for d in dim_order)
-    dask_chunks = tuple(chunked.chunksizes[d] for d in dim_order)
-
-    template = xr.Dataset(
-        data_vars={
-            "log_mean": (
-                dim_order,
-                da.empty(shape, chunks=dask_chunks, dtype=float),
-            ),
-            "log_stddev": (
-                dim_order,
-                da.empty(shape, chunks=dask_chunks, dtype=float),
-            ),
-        },
-        coords=chunked.coords,
-    )
+    chunked = ds.chunk()
     return chunked.map_blocks(
         gmm_worker,
         kwargs={
@@ -305,9 +270,7 @@ def run_ground_motion_model(
             "period": period,
             "logic_tree": logic_tree,
         },
-        template=template,
-    ).compute()
-
+    )
 
 @numba.guvectorize(
     [(numba.float64, numba.float64, numba.float64[:], numba.int8[:])],
@@ -324,6 +287,12 @@ def _fast_threshold_mask(mu, sigma, thresholds, out):
             out[t] = 0
 
 
+def _calculate_threshold_exceedance(mu, sigma, thresholds):
+    rng = np.random.default_rng()
+    
+    realisation = rng.normal(mu, sigma)
+    return realisation[..., np.newaxis] > thresholds
+
 def monte_carlo_threshold_occupancy(
     ground_motion_observations: xr.Dataset,
     thresholds: Array1,
@@ -331,15 +300,16 @@ def monte_carlo_threshold_occupancy(
     thresholds_da = xr.DataArray(
         np.log(thresholds), dims=["threshold"], coords={"threshold": thresholds}
     )
-
     counts = xr.apply_ufunc(
-        _fast_threshold_mask,
+        _calculate_threshold_exceedance,
         ground_motion_observations.log_mean,
         ground_motion_observations.log_stddev,
         thresholds_da,
         input_core_dims=[[], [], ["threshold"]],
         output_core_dims=[["threshold"]],
         output_dtypes=[np.int8],
+        dask="parallelized",
+        dask_gufunc_kwargs={"output_sizes": {"threshold": len(thresholds)}},
     )
     expected_sites = ground_motion_observations.site.values
     expected_ruptures = np.unique(ground_motion_observations.rupture.values)
@@ -348,7 +318,6 @@ def monte_carlo_threshold_occupancy(
         "site",
         "rupture",
         func="mean",
-        method="blockwise",
         expected_groups=(
             expected_sites,
             expected_ruptures,
@@ -365,7 +334,7 @@ def monte_carlo_threshold_occupancy(
     # Empirically, fastmath is ok here it barely changes the
     # difference in hazard. Disabled anyway because it only shaves a
     # minute off total hazard calculations.
-    target="parallel",
+    target="cpu",
 )
 def fast_norm_sf_numba(x, mu, sigma, res):
     z = (x - mu) / sigma
@@ -483,7 +452,7 @@ def calculate_monte_carlo_hazard(
             ruptures["rate"].to_xarray(),
             thresholds,
         )
-        hazards.append(hazard)
+        hazards.append(hazard.sum('rupture'))
 
     return xr.concat(hazards, dim=pd.Index(periods, name="period"))
 
@@ -604,7 +573,7 @@ def monte_carlo_hazard(
             current_seed,
             logic_tree=logic_tree
         )
-        all_hazard_results.append(run_hazard.sum("rupture"))
+        all_hazard_results.append(run_hazard)
 
     rupture_hazard_ensemble = xr.concat(
         all_hazard_results, dim=pd.Index(range(num_realisations), name="realisation")
