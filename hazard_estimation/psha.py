@@ -278,8 +278,7 @@ def gmm_worker(
 def run_ground_motion_model(
     ds: xr.Dataset, intensity_measure: str, period: float, logic_tree: bool
 ) -> xr.Dataset:
-    print(ds)
-    chunked = ds.chunk({"rupture": 1000})
+    chunked = ds.chunk({"rupture": 100})
     core_dims = ["site", "rupture"]
     others = [c for c in sorted(chunked.dims) if c not in core_dims]
     dim_order = others + core_dims
@@ -569,11 +568,12 @@ def monte_carlo_hazard(
     distributed_seismicity_path: Path,
     n: int,
     gmm_hazard_path: Path,
-    num_realisations: int = 10,  # Added this
+    num_realisations: int = 10,
     periods: list[float] | None = None,
     thresholds: list[float] | None = None,
     seed: int | None = None,
     column: str = "kl_density",
+    logic_tree: bool = False
 ) -> None:
     client = Client()
     print(f"Dashboard at {client.dashboard_link}")
@@ -602,6 +602,7 @@ def monte_carlo_hazard(
             n,
             column,
             current_seed,
+            logic_tree=logic_tree
         )
         all_hazard_results.append(run_hazard.sum("rupture"))
 
