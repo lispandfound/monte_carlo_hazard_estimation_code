@@ -458,9 +458,9 @@ THRESHOLDS = np.geomspace(0.1, 2.0, num=30)
 def load_hazard_inputs(
     ruptures_path: Path, source_to_site_path: Path, sites_path: Path
 ):
-    ruptures = pd.read_parquet(ruptures_path).rename_axis("rupture")
+    ruptures = pd.read_parquet(ruptures_path).rename_axis("rupture").to_xarray()
     source_to_site = xr.open_dataset(source_to_site_path, engine="h5netcdf")
-    sites = gpd.read_parquet(sites_path).rename_axis("site")
+    sites = gpd.read_parquet(sites_path).rename_axis("site").to_xarray()
     return ruptures, source_to_site, sites
 
 
@@ -519,9 +519,7 @@ def calculate_monte_carlo_hazard(
     logic_tree: bool = False,
 ) -> xr.DataArray:
     """End-to-end Python API for monte carlo hazard."""
-    count = np.round(n * ruptures[column] / ruptures[column].sum()).astype(int)
-    realisations = monte_carlo_sample(ruptures, count, STDDEV_LOWER, STDDEV_UPPER)
-    gmm_inputs = ground_motion_inputs(realisations, distances, sites)
+
     np.random.seed(seed=seed)
     hazards = []
     pbar = tqdm.tqdm(periods, unit="period", position=1, leave=False)
@@ -537,6 +535,33 @@ def calculate_monte_carlo_hazard(
         hazards.append(hazard.sum("rupture"))
 
     return xr.concat(hazards, dim=pd.Index(periods, name="period"))
+
+
+def draw_rupture_sample_counts(
+    density: pd.Series,
+    num_samples: int,
+    num_realisations: int,
+    random: bool,
+    seed: int | None = None,
+) -> xr.DataArray:
+    if random:
+        rng = np.random.default_rng(seed)
+        return xr.concat(
+            (
+                rng.multinomial(num_samples, density).to_xarray()
+                for i in range(num_realisations)
+            ),
+            dim="realisation",
+        )
+    else:
+        counts = np.round(num_samples * density / density.sum()).astype(int).to_xarray()
+        realisations = xr.DataArray(
+            np.arange(num_realisations),
+            dims=["realisation"],
+            coords=dict(realisation="realisation"),
+        )
+        (inputs, _) = xr.broadcast(counts, realisations)
+        return inputs
 
 
 @app.command()
@@ -561,6 +586,11 @@ def monte_carlo_hazard(
     )
     periods_arr = np.array(periods or DEFAULT_PERIODS)
     thresholds_arr = np.asarray(thresholds) if thresholds else THRESHOLDS
+
+    sample_counts = draw_rupture_sample_counts(
+        ruptures[column], n, num_realisations, random=False
+    )
+    gmm_inputs = ground_motion_inputs(realisations, distances, sites)
 
     # Collect ensemble results
     all_hazard_results = []
