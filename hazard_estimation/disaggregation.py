@@ -61,20 +61,16 @@ def period_independent_population_and_ds_weighted_sampling(
     sites: gpd.GeoDataFrame,
     ruptures: gpd.GeoDataFrame,
     rates: float,
-    periods: np.ndarray,
     random: bool = False,
 ) -> xr.DataArray:
     thresholds = hazard_thresholds(composite_hazard, rates)
-    rupture_hazard = composite_hazard.hazard.isel(threshold=thresholds).sel(
-        period=periods, method="nearest"
-    )
+    rupture_hazard = composite_hazard.hazard.isel(threshold=thresholds)
     sampling_density = optimal_hazard_sampling_densities(
         rupture_hazard, ruptures["rate"], random=random
     )
 
-    ds_hazard = composite_hazard.ds_hazard.isel(threshold=thresholds).sel(
-        period=periods, method="nearest"
-    )
+    ds_hazard = composite_hazard.ds_hazard.isel(threshold=thresholds)
+
     ds_contribution = ds_hazard / (
         rupture_hazard.sum("rupture") + ds_hazard
     )  # (period, site)
@@ -112,6 +108,52 @@ def magnitude_distribution_for_sampling_distribution(
     )
     density_da *= sampling_density
     return density_da
+
+
+@app.command()
+def hazard_sampling(
+    hazard_path: Path,
+    ruptures_path: Path,
+    sites_path: Path,
+    target_prob: float,
+    column: str,
+    random: bool = False,
+) -> None:
+    sites = gpd.read_parquet(sites_path).rename_axis("site")
+    ruptures = gpd.read_parquet(ruptures_path).rename_axis("rupture")
+    rate = -np.log(1 - np.array(target_prob)) / 50
+    with xr.open_dataset(hazard_path, engine="h5netcdf") as composite_hazard:
+        array = period_independent_population_and_ds_weighted_sampling(
+            composite_hazard,
+            sites,
+            ruptures,
+            rate,
+            random=random,
+        )
+        ruptures[column] = array.to_series()
+    ruptures.to_parquet(ruptures_path)
+
+
+@app.command()
+def baseline_sampling(
+    ruptures_path: Path,
+) -> None:
+    ruptures = gpd.read_parquet(ruptures_path).rename_axis("rupture")
+    magnitude, _ = psha.get_leonard_magnitude_params(
+        ruptures["area"] / 1e6, ruptures["rake"]
+    )
+    rupture_rate_sampling = ruptures["rate"] / ruptures["rate"].sum()
+
+    cybershake_counts = np.clip(27 * magnitude - 148, 14, 68)
+    cybershake_counts /= cybershake_counts.sum()
+
+    scec_counts = ruptures["area"] / (16 * 1e6)
+    scec_counts /= scec_counts.sum()
+
+    ruptures["scec_density"] = scec_counts
+    ruptures["cybershake_density"] = cybershake_counts
+    ruptures["rate_density"] = rupture_rate_sampling
+    ruptures.to_parquet(ruptures_path)
 
 
 @app.command()

@@ -2,6 +2,7 @@
 
 from distributed import Client
 
+import numpy.typing as npt
 import functools
 import math
 from pathlib import Path
@@ -30,6 +31,10 @@ app = cyclopts.App()
 
 STDDEV_UPPER = 1.0
 STDDEV_LOWER = -1.0
+
+
+def singleton_array(arr: npt.ArrayLike | list, name: str) -> xr.DataArray:
+    return xr.DataArray(arr, dims=[name], coords={name: arr})
 
 
 def get_leonard_magnitude_params(area: Array1, rake: Array1) -> tuple[Array1, Array1]:
@@ -111,21 +116,45 @@ def rupture_distances(source_to_site: pd.DataFrame) -> xr.Dataset:
 
 
 def ground_motion_inputs(
-    rupture_parameters: xr.DataArray,
+    rupture_parameters: xr.Dataset,
     rupture_distances: xr.Dataset,
-    sites: pd.DataFrame,
+    sites: xr.Dataset,
 ) -> xr.Dataset:
-    sites_arr = (
-        sites[["vs30", "Z1.0", "Z2.5"]]
-        .to_xarray()
-        .rename({"Z1.0": "z1pt0", "Z2.5": "z2pt5"})
+    sites_arr = sites[["vs30", "Z1.0", "Z2.5"]].rename(
+        {"Z1.0": "z1pt0", "Z2.5": "z2pt5"}
     )
-    rupture_distances = rupture_distances.sel(rupture=rupture_parameters.rupture)
-    return xr.merge(
+    potential_inputs = {
+        "mag",
+        "mag_sigma",
+        "area",
+        "rake",
+        "rate",
+        "dip",
+        "zbot",
+        "rrup",
+        "rx",
+        "ry",
+        "rjb",
+        "vs30",
+        "z1pt0",
+        "z2pt5",
+    }
+
+    dset = xr.merge(
         [rupture_parameters, rupture_distances, sites_arr],
         join="inner",
         compat="no_conflicts",
     )
+    mean_magnitude, sigma = get_leonard_magnitude_params(
+        dset["area"] / 1e6, dset["rake"]
+    )
+    dset["mag"] = mean_magnitude
+    dset["mag_sigma"] = ("rupture", sigma)
+
+    variables = set(dset)
+    gmm_variables = potential_inputs & variables
+    breakpoint()
+    return dset[gmm_variables]
 
 
 RRUP_INTERPOLANTS = np.array(
@@ -233,7 +262,7 @@ def estimate_compute(
 
 
 def gmm_worker(
-    ds_chunk: xr.Dataset, intensity_measure: str, period: float, logic_tree: bool
+    ds_chunk: xr.Dataset, intensity_measure: str, logic_tree: bool
 ) -> xr.Dataset:
     """
     This is your original logic, acting on a single chunk of data.
@@ -243,13 +272,14 @@ def gmm_worker(
     df["vs30measured"] = True
     df["ztor"] = 0.0
     df["hypo_depth"] = df["zbot"] / 2.0
+    periods = [] if intensity_measure == "pSA" else ds_chunk.periods.values
     if logic_tree:
         gmm_outputs = oqw.run_gmm_logic_tree(
             oqw.constants.GMMLogicTree.NSHM2022,
             oqw.constants.TectType.ACTIVE_SHALLOW,
             df,
             intensity_measure,
-            periods=[period],
+            periods=periods,
         )
     else:
         gmm_outputs = oqw.run_gmm(
@@ -257,8 +287,9 @@ def gmm_worker(
             oqw.constants.TectType.ACTIVE_SHALLOW,
             df,
             intensity_measure,
-            periods=[period],
+            periods=periods,
         )
+
     gmm_ds = xr.merge((gmm_outputs.to_xarray(), ds_chunk))
     variables = list(gmm_ds.data_vars)
     im_mean = next(c for c in variables if c.endswith("_mean"))
@@ -268,14 +299,15 @@ def gmm_worker(
 
 
 def run_ground_motion_model(
-    ds: xr.Dataset, intensity_measure: str, period: float, logic_tree: bool
+    ds: xr.Dataset,
+    magnitude_seeds: xr.DataArray,
+    intensity_measure: str,
+    logic_tree: bool,
 ) -> xr.Dataset:
-    chunked = ds.chunk()
-    return chunked.map_blocks(
+    return ds.map_blocks(
         gmm_worker,
         kwargs={
             "intensity_measure": intensity_measure,
-            "period": period,
             "logic_tree": logic_tree,
         },
     )
@@ -428,7 +460,7 @@ def calculate_analytical_hazard(
 
     gmm_hazards = []
     for period in tqdm.tqdm(periods, unit="period"):
-        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period, logic_tree)
+        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", logic_tree)
         hazard = aggregate_analytical_hazard(gmm_outputs, rates, thresholds)
         gmm_hazards.append(hazard)
 
@@ -507,61 +539,44 @@ def hazard(
     )
 
 
-def calculate_monte_carlo_hazard(
-    ruptures: pd.DataFrame,
-    distances: xr.Dataset,
-    sites: pd.DataFrame,
-    periods: Array1,
-    thresholds: Array1,
-    n: int,
-    column: str,
-    seed: int | None,
-    logic_tree: bool = False,
-) -> xr.DataArray:
-    """End-to-end Python API for monte carlo hazard."""
+# def calculate_monte_carlo_hazard(
+#     counts: xr.DataArray,
+#     gmm_outputs: xr.Dataset,
+#     seed: int | None,
+#     logic_tree: bool = False,
+# ) -> xr.DataArray:
+#     """End-to-end Python API for monte carlo hazard."""
 
-    np.random.seed(seed=seed)
-    hazards = []
-    pbar = tqdm.tqdm(periods, unit="period", position=1, leave=False)
 
-    for period in pbar:
-        pbar.set_description(f"pSA({period:.2f})")
-        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period, logic_tree)
-        hazard = aggregate_monte_carlo_hazard(
-            gmm_outputs,
-            ruptures["rate"].to_xarray(),
-            thresholds,
-        )
-        hazards.append(hazard.sum("rupture"))
+#         pbar.set_description(f"pSA({period:.2f})")
+#         gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period, logic_tree)
+#         hazard = aggregate_monte_carlo_hazard(
+#             gmm_outputs,
+#             ruptures["rate"].to_xarray(),
+#             thresholds,
+#         )
+#         hazards.append(hazard.sum("rupture"))
 
-    return xr.concat(hazards, dim=pd.Index(periods, name="period"))
+#     return xr.concat(hazards, dim=pd.Index(periods, name="period"))
 
 
 def draw_rupture_sample_counts(
-    density: pd.Series,
+    density: xr.DataArray,
     num_samples: int,
     num_realisations: int,
     random: bool,
-    seed: int | None = None,
+    rng: np.random.Generator,
 ) -> xr.DataArray:
     if random:
-        rng = np.random.default_rng(seed)
-        return xr.concat(
-            (
-                rng.multinomial(num_samples, density).to_xarray()
-                for i in range(num_realisations)
-            ),
+        inputs = xr.concat(
+            (rng.multinomial(num_samples, density) for i in range(num_realisations)),
             dim="realisation",
         )
     else:
-        counts = np.round(num_samples * density / density.sum()).astype(int).to_xarray()
-        realisations = xr.DataArray(
-            np.arange(num_realisations),
-            dims=["realisation"],
-            coords=dict(realisation="realisation"),
-        )
+        counts = np.round(num_samples * density / density.sum()).astype(int)
+        realisations = singleton_array(np.arange(num_realisations), "realisation")
         (inputs, _) = xr.broadcast(counts, realisations)
-        return inputs
+    return inputs
 
 
 @app.command()
@@ -575,7 +590,7 @@ def monte_carlo_hazard(
     num_realisations: int = 10,
     periods: list[float] | None = None,
     thresholds: list[float] | None = None,
-    seed: int | None = None,
+    seed: int = 0,
     column: str = "kl_density",
     logic_tree: bool = False,
 ) -> None:
@@ -586,12 +601,24 @@ def monte_carlo_hazard(
     )
     periods_arr = np.array(periods or DEFAULT_PERIODS)
     thresholds_arr = np.asarray(thresholds) if thresholds else THRESHOLDS
-
+    breakpoint()
+    seed_sequence = np.random.SeedSequence(seed)
+    seeds = seed_sequence.spawn(3)
     sample_counts = draw_rupture_sample_counts(
-        ruptures[column], n, num_realisations, random=False
+        ruptures[column],
+        n,
+        num_realisations,
+        random=False,
+        rng=np.random.default_rng(seeds[0]),
     )
-    gmm_inputs = ground_motion_inputs(realisations, distances, sites)
-
+    gmm_inputs = ground_motion_inputs(ruptures, source_to_site, sites)
+    # Broadcast to all periods
+    periods_da = singleton_array(periods_arr, "periods")
+    (gmm_inputs, _) = xr.broadcast(gmm_inputs, periods_da)
+    breakpoint()
+    gmm_outputs = run_ground_motion_model(
+        gmm_inputs, magnitude_variate, "pSA", logic_tree
+    )
     # Collect ensemble results
     all_hazard_results = []
 
