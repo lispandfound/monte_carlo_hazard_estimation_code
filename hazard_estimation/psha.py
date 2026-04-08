@@ -72,9 +72,14 @@ def monte_carlo_sample(
     magnitudes = sp.stats.truncnorm.rvs(
         z_lower, z_upper, loc=mean_magnitude, scale=sigma
     )
-    sample['mag'] = magnitudes
-    dset = sample[['rake', 'area', 'mag', 'zbot', 'dip']].reset_index().rename_axis('sample').to_xarray()
-    dset = dset.set_coords('rupture')
+    sample["mag"] = magnitudes
+    dset = (
+        sample[["rake", "area", "mag", "zbot", "dip"]]
+        .reset_index()
+        .rename_axis("sample")
+        .to_xarray()
+    )
+    dset = dset.set_coords("rupture")
     return dset
 
 
@@ -116,7 +121,11 @@ def ground_motion_inputs(
         .rename({"Z1.0": "z1pt0", "Z2.5": "z2pt5"})
     )
     rupture_distances = rupture_distances.sel(rupture=rupture_parameters.rupture)
-    return xr.merge([rupture_parameters, rupture_distances, sites_arr], join="inner", compat='no_conflicts')
+    return xr.merge(
+        [rupture_parameters, rupture_distances, sites_arr],
+        join="inner",
+        compat="no_conflicts",
+    )
 
 
 RRUP_INTERPOLANTS = np.array(
@@ -223,7 +232,6 @@ def estimate_compute(
     return compute_df
 
 
-
 def gmm_worker(
     ds_chunk: xr.Dataset, intensity_measure: str, period: float, logic_tree: bool
 ) -> xr.Dataset:
@@ -258,6 +266,7 @@ def gmm_worker(
     res = gmm_ds[[im_mean, im_std]].rename({im_mean: "log_mean", im_std: "log_stddev"})
     return res
 
+
 def run_ground_motion_model(
     ds: xr.Dataset, intensity_measure: str, period: float, logic_tree: bool
 ) -> xr.Dataset:
@@ -270,6 +279,7 @@ def run_ground_motion_model(
             "logic_tree": logic_tree,
         },
     )
+
 
 @numba.guvectorize(
     [(numba.float64, numba.float64, numba.float64[:], numba.int8[:])],
@@ -288,9 +298,10 @@ def _fast_threshold_mask(mu, sigma, thresholds, out):
 
 def _calculate_threshold_exceedance(mu, sigma, thresholds):
     rng = np.random.default_rng()
-    
+
     realisation = rng.normal(mu, sigma)
     return realisation[..., np.newaxis] > thresholds
+
 
 def monte_carlo_threshold_occupancy(
     ground_motion_observations: xr.Dataset,
@@ -424,38 +435,6 @@ def calculate_analytical_hazard(
     return xr.concat(gmm_hazards, dim=pd.Index(periods, name="period"))
 
 
-def calculate_monte_carlo_hazard(
-    ruptures: pd.DataFrame,
-    distances: xr.Dataset,
-    sites: pd.DataFrame,
-    periods: Array1,
-    thresholds: Array1,
-    n: int,
-    column: str,
-    seed: int | None,
-    logic_tree: bool = False,
-) -> xr.DataArray:
-    """End-to-end Python API for monte carlo hazard."""
-    count = np.round(n * ruptures[column] / ruptures[column].sum()).astype(int)
-    realisations = monte_carlo_sample(ruptures, count, STDDEV_LOWER, STDDEV_UPPER)
-    gmm_inputs = ground_motion_inputs(realisations, distances, sites)
-    np.random.seed(seed=seed)
-    hazards = []
-    pbar = tqdm.tqdm(periods, unit="period", position=1, leave=False)
-
-    for period in pbar:
-        pbar.set_description(f"pSA({period:.2f})")
-        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period, logic_tree)
-        hazard = aggregate_monte_carlo_hazard(
-            gmm_outputs,
-            ruptures["rate"].to_xarray(),
-            thresholds,
-        )
-        hazards.append(hazard.sum('rupture'))
-
-    return xr.concat(hazards, dim=pd.Index(periods, name="period"))
-
-
 DEFAULT_PERIODS = [
     0.1,
     0.12,
@@ -528,6 +507,38 @@ def hazard(
     )
 
 
+def calculate_monte_carlo_hazard(
+    ruptures: pd.DataFrame,
+    distances: xr.Dataset,
+    sites: pd.DataFrame,
+    periods: Array1,
+    thresholds: Array1,
+    n: int,
+    column: str,
+    seed: int | None,
+    logic_tree: bool = False,
+) -> xr.DataArray:
+    """End-to-end Python API for monte carlo hazard."""
+    count = np.round(n * ruptures[column] / ruptures[column].sum()).astype(int)
+    realisations = monte_carlo_sample(ruptures, count, STDDEV_LOWER, STDDEV_UPPER)
+    gmm_inputs = ground_motion_inputs(realisations, distances, sites)
+    np.random.seed(seed=seed)
+    hazards = []
+    pbar = tqdm.tqdm(periods, unit="period", position=1, leave=False)
+
+    for period in pbar:
+        pbar.set_description(f"pSA({period:.2f})")
+        gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period, logic_tree)
+        hazard = aggregate_monte_carlo_hazard(
+            gmm_outputs,
+            ruptures["rate"].to_xarray(),
+            thresholds,
+        )
+        hazards.append(hazard.sum("rupture"))
+
+    return xr.concat(hazards, dim=pd.Index(periods, name="period"))
+
+
 @app.command()
 def monte_carlo_hazard(
     ruptures_path: Path,
@@ -541,7 +552,7 @@ def monte_carlo_hazard(
     thresholds: list[float] | None = None,
     seed: int | None = None,
     column: str = "kl_density",
-    logic_tree: bool = False
+    logic_tree: bool = False,
 ) -> None:
     client = Client()
     print(f"Dashboard at {client.dashboard_link}")
@@ -570,7 +581,7 @@ def monte_carlo_hazard(
             n,
             column,
             current_seed,
-            logic_tree=logic_tree
+            logic_tree=logic_tree,
         )
         all_hazard_results.append(run_hazard)
 
