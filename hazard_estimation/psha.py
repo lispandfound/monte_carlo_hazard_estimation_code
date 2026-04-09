@@ -1,5 +1,8 @@
 """Analytically integrate PSHA to obtain a hazard curve"""
 
+import parse
+
+
 from distributed import Client
 
 import numpy.typing as npt
@@ -7,6 +10,8 @@ import functools
 import math
 from pathlib import Path
 
+from dask.diagnostics import ProgressBar
+import dask.array as da
 import cyclopts
 import flox.xarray
 import geopandas as gpd
@@ -34,10 +39,12 @@ STDDEV_LOWER = -1.0
 
 
 def singleton_array(arr: npt.ArrayLike | list, name: str) -> xr.DataArray:
-    return xr.DataArray(arr, dims=[name], coords={name: arr})
+    return xr.DataArray(arr, dims=[name], coords={name: arr}, name=name)
 
 
-def get_leonard_magnitude_params(area: Array1, rake: Array1) -> tuple[Array1, Array1]:
+def get_leonard_magnitude_params(
+    area: xr.DataArray, rake: xr.DataArray
+) -> tuple[xr.DataArray, xr.DataArray]:
     """Leonard (2014) magnitude scaling parameters.
 
     Parameters
@@ -56,10 +63,10 @@ def get_leonard_magnitude_params(area: Array1, rake: Array1) -> tuple[Array1, Ar
     is_strike_slip = (abs_rake <= 45) | (abs_rake >= 135)
 
     # Strike-slip: mu=3.99, sigma=0.26 | Others: mu=4.03, sigma=0.30
-    mu_constant = np.where(is_strike_slip, 3.99, 4.03)
-    sigma = np.where(is_strike_slip, 0.26, 0.30)
+    mu_constant = xr.where(is_strike_slip, 3.99, 4.03)
+    sigma = xr.where(is_strike_slip, 0.26, 0.30).rename("sigma")
     mean_magnitude = np.log10(area) + mu_constant
-
+    mean_magnitude = mean_magnitude.rename("mean_magnitude")
     return mean_magnitude, sigma
 
 
@@ -125,6 +132,7 @@ def ground_motion_inputs(
     )
     potential_inputs = {
         "mag",
+        "mean_mag",
         "mag_sigma",
         "area",
         "rake",
@@ -145,15 +153,13 @@ def ground_motion_inputs(
         join="inner",
         compat="no_conflicts",
     )
-    mean_magnitude, sigma = get_leonard_magnitude_params(
-        dset["area"] / 1e6, dset["rake"]
-    )
-    dset["mag"] = mean_magnitude
-    dset["mag_sigma"] = ("rupture", sigma)
+
+    dset["mean_mag"] = mean_magnitude
+    dset["mag_sigma"] = sigma
+    dset = dset.drop_vars("mag")
 
     variables = set(dset)
     gmm_variables = potential_inputs & variables
-    breakpoint()
     return dset[gmm_variables]
 
 
@@ -261,56 +267,73 @@ def estimate_compute(
     return compute_df
 
 
-def gmm_worker(
-    ds_chunk: xr.Dataset, intensity_measure: str, logic_tree: bool
+def run_ground_motion_model(
+    ruptures: xr.Dataset,
+    source_to_site: xr.Dataset,
+    sites: xr.Dataset,
+    periods: xr.DataArray,
+    models: xr.DataArray,
+    intensity_measure: str,
 ) -> xr.Dataset:
-    """
-    This is your original logic, acting on a single chunk of data.
-    """
-    stacked = ds_chunk.stack(coord=ds_chunk.dims)
+    inputs = xr.merge([ruptures, source_to_site, sites], join="inner")
+
+    original_dims = list(inputs.dims)
+    stacked = inputs.stack(coord=original_dims)
+
     df = stacked.to_dataframe()
     df["vs30measured"] = True
     df["ztor"] = 0.0
     df["hypo_depth"] = df["zbot"] / 2.0
-    periods = [] if intensity_measure == "pSA" else ds_chunk.periods.values
-    if logic_tree:
-        gmm_outputs = oqw.run_gmm_logic_tree(
-            oqw.constants.GMMLogicTree.NSHM2022,
-            oqw.constants.TectType.ACTIVE_SHALLOW,
-            df,
-            intensity_measure,
-            periods=periods,
-        )
-    else:
+
+    model_results = []
+
+    # Patterns for parsing columns
+    mean_pattern = "pSA_{p:f}_mean"
+    std_pattern = "pSA_{p:f}_std_Total"
+
+    for model in models.values:
         gmm_outputs = oqw.run_gmm(
-            oqw.constants.GMM.A_22,
+            model,
             oqw.constants.TectType.ACTIVE_SHALLOW,
             df,
             intensity_measure,
-            periods=periods,
+            periods=periods.values,
         )
 
-    gmm_ds = xr.merge((gmm_outputs.to_xarray(), ds_chunk))
-    variables = list(gmm_ds.data_vars)
-    im_mean = next(c for c in variables if c.endswith("_mean"))
-    im_std = next(c for c in variables if c.endswith("_std_Total"))
-    res = gmm_ds[[im_mean, im_std]].rename({im_mean: "log_mean", im_std: "log_stddev"})
-    return res
+        period_data = {p: {"mean": None, "std": None} for p in periods.values}
 
+        for column in gmm_outputs.columns:
+            if res := parse.parse(mean_pattern, column):
+                p_val = res["p"]
+                period_data[p_val]["mean"] = gmm_outputs[column].values
+            elif res := parse.parse(std_pattern, column):
+                p_val = res["p"]
+                period_data[p_val]["std"] = gmm_outputs[column].values
 
-def run_ground_motion_model(
-    ds: xr.Dataset,
-    magnitude_seeds: xr.DataArray,
-    intensity_measure: str,
-    logic_tree: bool,
-) -> xr.Dataset:
-    return ds.map_blocks(
-        gmm_worker,
-        kwargs={
-            "intensity_measure": intensity_measure,
-            "logic_tree": logic_tree,
-        },
+        means_stacked = np.stack(
+            [period_data[p]["mean"] for p in periods.values], axis=1
+        )
+        stds_stacked = np.stack([period_data[p]["std"] for p in periods.values], axis=1)
+
+        ds_model = xr.Dataset(
+            data_vars={
+                "log_mean": (["coord", "period"], means_stacked.astype(np.float32)),
+                "log_stddev": (["coord", "period"], stds_stacked.astype(np.float32)),
+            },
+            coords={
+                "coord": stacked.coord,
+                "period": periods.values,
+            },
+        )
+        model_results.append(ds_model)
+
+    da_all_models = xr.concat(
+        model_results, dim=xr.DataArray(models.values, name="gmm", dims=["gmm"])
     )
+
+    final_output = da_all_models.unstack("coord")
+
+    return final_output.transpose("gmm", "period", "rupture", "site", "z")
 
 
 @numba.guvectorize(
@@ -490,9 +513,23 @@ THRESHOLDS = np.geomspace(0.1, 2.0, num=30)
 def load_hazard_inputs(
     ruptures_path: Path, source_to_site_path: Path, sites_path: Path
 ):
-    ruptures = pd.read_parquet(ruptures_path).rename_axis("rupture").to_xarray()
+    df_ruptures = pd.read_parquet(ruptures_path)[["mag", "area", "rake", "zbot", "dip"]]
+    rupture_ids = df_ruptures.index.values
+    ruptures = xr.Dataset.from_dataframe(df_ruptures)
+    ruptures = ruptures.assign_coords(rupture=rupture_ids)
+
     source_to_site = xr.open_dataset(source_to_site_path, engine="h5netcdf")
-    sites = gpd.read_parquet(sites_path).rename_axis("site").to_xarray()
+
+    gdf_sites = gpd.read_parquet(sites_path)
+    site_ids = gdf_sites.index.values.astype(str)  # Force to string array
+
+    sites_subset = gdf_sites[["vs30", "Z1.0", "Z2.5"]].rename(
+        columns={"Z1.0": "z1pt0", "Z2.5": "z2pt5"}
+    )
+
+    sites = xr.Dataset.from_dataframe(pd.DataFrame(sites_subset))
+    sites = sites.assign_coords(site=site_ids)
+
     return ruptures, source_to_site, sites
 
 
@@ -579,6 +616,120 @@ def draw_rupture_sample_counts(
     return inputs
 
 
+def bin_magnitudes(
+    mean_magnitude: xr.DataArray, sigma: xr.DataArray, num_bins: int
+) -> xr.DataArray:
+    z = np.linspace(-1, 1, num=num_bins)
+    z_arr = singleton_array(z, "z")
+    return mean_magnitude + z_arr * sigma
+
+
+def logic_tree_with_weights() -> xr.DataArray:
+    epistemic_branch_lower = -1.2815
+    epistemic_branch_upper = 1.2815
+    epistemic_branch_central = 0
+    logic_tree_data = [
+        (oqw.constants.GMM.S_22, epistemic_branch_upper, 0.117),
+        (oqw.constants.GMM.S_22, epistemic_branch_central, 0.156),
+        (oqw.constants.GMM.S_22, epistemic_branch_lower, 0.117),
+        (oqw.constants.GMM.A_22, epistemic_branch_upper, 0.084),
+        (oqw.constants.GMM.A_22, epistemic_branch_central, 0.112),
+        (oqw.constants.GMM.A_22, epistemic_branch_lower, 0.084),
+        (oqw.constants.GMM.ASK_14, epistemic_branch_upper, 0.0198),
+        (oqw.constants.GMM.ASK_14, epistemic_branch_central, 0.0264),
+        (oqw.constants.GMM.ASK_14, epistemic_branch_lower, 0.0198),
+        (oqw.constants.GMM.BSSA_14, epistemic_branch_upper, 0.0198),
+        (oqw.constants.GMM.BSSA_14, epistemic_branch_central, 0.0264),
+        (oqw.constants.GMM.BSSA_14, epistemic_branch_lower, 0.0198),
+        (oqw.constants.GMM.CB_14, epistemic_branch_upper, 0.0198),
+        (oqw.constants.GMM.CB_14, epistemic_branch_central, 0.0264),
+        (oqw.constants.GMM.CB_14, epistemic_branch_lower, 0.0198),
+        (oqw.constants.GMM.CY_14, epistemic_branch_upper, 0.0198),
+        (oqw.constants.GMM.CY_14, epistemic_branch_central, 0.0264),
+        (oqw.constants.GMM.CY_14, epistemic_branch_lower, 0.0198),
+        (oqw.constants.GMM.Br_13, epistemic_branch_upper, 0.0198),
+        (oqw.constants.GMM.Br_13, epistemic_branch_central, 0.0264),
+        (oqw.constants.GMM.Br_13, epistemic_branch_lower, 0.0198),
+    ]
+    df = pd.DataFrame(
+        logic_tree_data, columns=["gmm", "epistemic_branch", "weight"]
+    ).set_index(["gmm", "epistemic_branch"])
+    weights = df["weight"]
+    da = weights.to_xarray()
+    da.name = "weights"
+    return da
+
+
+def map_blocks_template_for(ruptures, sites, periods, gmms) -> xr.Dataset:
+    z = ruptures.z.values
+    ruptures = ruptures.rupture.values
+    sites = sites.site.values
+    gmms = gmms.gmm.values
+
+    array = da.empty(
+        (len(gmms), len(periods), len(ruptures), len(sites), len(z)), dtype=np.float32
+    )
+    return xr.Dataset(
+        dict(
+            log_mean=(("gmm", "period", "rupture", "site", "z"), array),
+            log_stddev=(("gmm", "period", "rupture", "site", "z"), array),
+        ),
+        coords=dict(rupture=ruptures, site=sites, period=periods, gmm=gmms, z=z),
+    )
+
+
+@app.command()
+def ground_motion_database(
+    ruptures_path: Path,
+    source_to_site_path: Path,
+    sites_path: Path,
+    periods: list[float] | None = None,
+    logic_tree: bool = False,
+    rupture_chunk: int = 50,
+    site_chunk: int = 50,
+    z_chunk: int = -1,
+) -> None:
+    client = Client()
+    print(f"Dashboard at {client.dashboard_link}")
+    ruptures, source_to_site, sites = load_hazard_inputs(
+        ruptures_path, source_to_site_path, sites_path
+    )
+    source_to_site = source_to_site.sel(
+        rupture=ruptures.rupture.values, site=sites.site.values
+    )
+
+    mean_magnitude, sigma = get_leonard_magnitude_params(
+        ruptures["area"] / 1e6, ruptures["rake"]
+    )
+    magnitudes = bin_magnitudes(mean_magnitude, sigma, num_bins=15)
+    ruptures["mag"] = magnitudes
+
+    periods_da = singleton_array(np.array(periods or DEFAULT_PERIODS), "period")
+
+    models = logic_tree_with_weights()
+    chunks = dict(rupture=rupture_chunk, z=z_chunk, site=site_chunk, gmm=-1, period=-1)
+
+    template = map_blocks_template_for(ruptures, sites, periods_da, models)
+    template = template.chunk(chunks)
+    source_to_site = source_to_site.chunk(dict(rupture=rupture_chunk))
+    gmm_outputs = xr.map_blocks(
+        run_ground_motion_model,
+        ruptures.chunk(dict(rupture=rupture_chunk)),
+        args=[
+            source_to_site.chunk(dict(rupture=rupture_chunk, site=site_chunk)),
+            sites.chunk(dict(site=site_chunk)),
+        ],
+        kwargs=dict(intensity_measure="pSA", periods=periods_da, models=models.gmm),
+        template=template,
+    )
+    with ProgressBar():
+        gmm_outputs.to_zarr("gmm_outputs.zarr", mode="w")
+    # gmm_outputs = run_ground_motion_model(
+    #     gmm_inputs, magnitude_variate, "pSA", logic_tree
+    # )
+    # gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", logic_tree)
+
+
 @app.command()
 def monte_carlo_hazard(
     ruptures_path: Path,
@@ -601,7 +752,6 @@ def monte_carlo_hazard(
     )
     periods_arr = np.array(periods or DEFAULT_PERIODS)
     thresholds_arr = np.asarray(thresholds) if thresholds else THRESHOLDS
-    breakpoint()
     seed_sequence = np.random.SeedSequence(seed)
     seeds = seed_sequence.spawn(3)
     sample_counts = draw_rupture_sample_counts(
@@ -613,12 +763,9 @@ def monte_carlo_hazard(
     )
     gmm_inputs = ground_motion_inputs(ruptures, source_to_site, sites)
     # Broadcast to all periods
-    periods_da = singleton_array(periods_arr, "periods")
-    (gmm_inputs, _) = xr.broadcast(gmm_inputs, periods_da)
+
     breakpoint()
-    gmm_outputs = run_ground_motion_model(
-        gmm_inputs, magnitude_variate, "pSA", logic_tree
-    )
+
     # Collect ensemble results
     all_hazard_results = []
 
