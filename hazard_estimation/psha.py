@@ -682,6 +682,7 @@ def ground_motion_database(
     ruptures_path: Path,
     source_to_site_path: Path,
     sites_path: Path,
+    output: Path
     periods: list[float] | None = None,
     logic_tree: bool = False,
     rupture_chunk: int = 50,
@@ -722,7 +723,7 @@ def ground_motion_database(
         template=template,
     )
     with ProgressBar():
-        gmm_outputs.to_zarr("gmm_outputs.zarr", mode="w")
+        gmm_outputs.to_zarr(output, mode="w")
     # gmm_outputs = run_ground_motion_model(
     #     gmm_inputs, magnitude_variate, "pSA", logic_tree
     # )
