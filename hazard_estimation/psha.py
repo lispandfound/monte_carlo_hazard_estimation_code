@@ -2,7 +2,7 @@
 
 import parse
 
-from distributed import Client
+from distributed import Client, LocalCluster
 
 import numpy.typing as npt
 import functools
