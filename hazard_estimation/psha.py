@@ -682,7 +682,7 @@ def ground_motion_database(
     ruptures_path: Path,
     source_to_site_path: Path,
     sites_path: Path,
-    output: Path
+    output: Path,
     periods: list[float] | None = None,
     logic_tree: bool = False,
     rupture_chunk: int = 50,
