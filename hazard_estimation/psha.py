@@ -689,8 +689,6 @@ def ground_motion_database(
     site_chunk: int = 50,
     z_chunk: int = -1,
 ) -> None:
-    client = Client(address="0.0.0.0:8787")
-    print(f"Dashboard at {client.dashboard_link}")
     ruptures, source_to_site, sites = load_hazard_inputs(
         ruptures_path, source_to_site_path, sites_path
     )
@@ -712,18 +710,24 @@ def ground_motion_database(
     template = map_blocks_template_for(ruptures, sites, periods_da, models)
     template = template.chunk(chunks)
     source_to_site = source_to_site.chunk(dict(rupture=rupture_chunk))
-    gmm_outputs = xr.map_blocks(
-        run_ground_motion_model,
-        ruptures.chunk(dict(rupture=rupture_chunk)),
-        args=[
-            source_to_site.chunk(dict(rupture=rupture_chunk, site=site_chunk)),
-            sites.chunk(dict(site=site_chunk)),
-        ],
-        kwargs=dict(intensity_measure="pSA", periods=periods_da, models=models.gmm),
-        template=template,
-    )
-    with ProgressBar():
-        gmm_outputs.to_zarr(output, mode="w")
+    with (
+        LocalCluster(host="0.0.0.0", dashboard_address=":8787") as cluster,
+        Client(cluster) as client,
+    ):
+        print(f"Dashboard at {client.dashboard_link}")
+
+        gmm_outputs = xr.map_blocks(
+            run_ground_motion_model,
+            ruptures.chunk(dict(rupture=rupture_chunk)),
+            args=[
+                source_to_site.chunk(dict(rupture=rupture_chunk, site=site_chunk)),
+                sites.chunk(dict(site=site_chunk)),
+            ],
+            kwargs=dict(intensity_measure="pSA", periods=periods_da, models=models.gmm),
+            template=template,
+        )
+        with ProgressBar():
+            gmm_outputs.to_zarr(output, mode="w")
     # gmm_outputs = run_ground_motion_model(
     #     gmm_inputs, magnitude_variate, "pSA", logic_tree
     # )
