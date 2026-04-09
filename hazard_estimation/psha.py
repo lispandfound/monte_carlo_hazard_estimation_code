@@ -2,7 +2,6 @@
 
 import parse
 
-
 from distributed import Client
 
 import numpy.typing as npt
@@ -689,7 +688,7 @@ def ground_motion_database(
     site_chunk: int = 50,
     z_chunk: int = -1,
 ) -> None:
-    client = Client()
+    client = Client(address="0.0.0.0:8787")
     print(f"Dashboard at {client.dashboard_link}")
     ruptures, source_to_site, sites = load_hazard_inputs(
         ruptures_path, source_to_site_path, sites_path
