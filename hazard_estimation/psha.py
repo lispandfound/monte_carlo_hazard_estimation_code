@@ -853,35 +853,34 @@ def monte_carlo_hazard(
     seed: int = 0,
     column: str = "kl_density",
 ) -> None:
-    with Client():
-        ruptures = gpd.read_parquet(ruptures).rename_axis("rupture")
-        gmm_database = xr.open_dataset(ground_motion_database)
-        thresholds_arr = np.asarray(thresholds) if thresholds else THRESHOLDS
-        thresholds_da = np.log(singleton_array(thresholds_arr, "threshold"))
+    ruptures = gpd.read_parquet(ruptures).rename_axis("rupture")
+    gmm_database = xr.open_dataset(ground_motion_database)
+    thresholds_arr = np.asarray(thresholds) if thresholds else THRESHOLDS
+    thresholds_da = np.log(singleton_array(thresholds_arr, "threshold"))
 
-        # Collect ensemble results
-        all_hazard_results = []
-        logic_tree = logic_tree_with_weights()
-        # Range is from seed to seed + num_realisations to ensure independence
-        rng = np.random.default_rng(seed)
-        for i in tqdm.trange(num_realisations, unit="realisation"):
-            sample_array = draw_sample_inputs(
-                n, ruptures[column].to_xarray(), logic_tree, gmm_database, rng=rng
-            )
-            sample_array = sample_array.chunk(dict(sample=50, site=50, period=-1))
-            samples = sample_ground_motions(sample_array, gmm_database)
-            rate = ruptures["rate"].to_xarray()
-            hazard = (rate * (samples > thresholds_da).mean("sample")).sum("rupture")
-
-            all_hazard_results.append(hazard)
-
-        rupture_hazard_ensemble = xr.concat(
-            all_hazard_results,
-            dim=pd.Index(range(num_realisations), name="realisation"),
+    # Collect ensemble results
+    all_hazard_results = []
+    logic_tree = logic_tree_with_weights()
+    # Range is from seed to seed + num_realisations to ensure independence
+    rng = np.random.default_rng(seed)
+    for i in tqdm.trange(num_realisations, unit="realisation"):
+        sample_array = draw_sample_inputs(
+            n, ruptures[column].to_xarray(), logic_tree, gmm_database, rng=rng
         )
-        rupture_hazard_ensemble.attrs["seed"] = seed
+        sample_array = sample_array.chunk(dict(sample=50, site=50, period=-1))
+        samples = sample_ground_motions(sample_array, gmm_database)
+        rate = ruptures["rate"].to_xarray()
+        hazard = (rate * (samples > thresholds_da).mean("sample")).sum("rupture")
 
-        rupture_hazard_ensemble.to_zarr(gmm_hazard_path, mode="w")
+        all_hazard_results.append(hazard)
+
+    rupture_hazard_ensemble = xr.concat(
+        all_hazard_results,
+        dim=pd.Index(range(num_realisations), name="realisation"),
+    )
+    rupture_hazard_ensemble.attrs["seed"] = seed
+
+    rupture_hazard_ensemble.to_zarr(gmm_hazard_path, mode="w")
 
 
 if __name__ == "__main__":
