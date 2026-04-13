@@ -849,7 +849,7 @@ def monte_carlo_hazard(
     n: int,
     gmm_hazard_path: Path,
     thresholds: list[float] | None = None,
-    num_realisations: int = 10,
+    num_realisations: int = 100,
     seed: int = 0,
     column: str = "kl_density",
 ) -> None:
