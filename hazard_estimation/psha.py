@@ -848,14 +848,13 @@ def monte_carlo_hazard(
     ground_motion_database: Path,
     n: int,
     gmm_hazard_path: Path,
-    thresholds: list[float] | None = None,
     num_realisations: int = 100,
     seed: int = 0,
     column: str = "kl_density",
 ) -> None:
     ruptures = gpd.read_parquet(ruptures).rename_axis("rupture")
     gmm_database = xr.open_dataset(ground_motion_database)
-    thresholds_arr = np.asarray(thresholds) if thresholds else THRESHOLDS
+    thresholds_arr = THRESHOLDS
     thresholds_da = np.log(singleton_array(thresholds_arr, "threshold"))
 
     # Collect ensemble results
