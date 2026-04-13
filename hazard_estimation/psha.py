@@ -22,6 +22,8 @@ import scipy as sp
 import shapely
 import tqdm
 import xarray as xr
+from openquake.hazardlib.cross_correlation import BakerJayaram2008
+from openquake.hazardlib.imt import SA
 
 Array1 = np.ndarray[tuple[int,], np.dtype[np.float64]]
 Array2 = np.ndarray[tuple[int, int], np.dtype[np.float64]]
@@ -596,23 +598,24 @@ def hazard(
 #     return xr.concat(hazards, dim=pd.Index(periods, name="period"))
 
 
-def draw_rupture_sample_counts(
+def draw_ruptures(
     density: xr.DataArray,
     num_samples: int,
-    num_realisations: int,
     random: bool,
     rng: np.random.Generator,
-) -> xr.DataArray:
+) -> np.ndarray:
     if random:
-        inputs = xr.concat(
-            (rng.multinomial(num_samples, density) for i in range(num_realisations)),
-            dim="realisation",
-        )
+        counts = rng.multinomial(num_samples, density)
     else:
-        counts = np.round(num_samples * density / density.sum()).astype(int)
-        realisations = singleton_array(np.arange(num_realisations), "realisation")
-        (inputs, _) = xr.broadcast(counts, realisations)
-    return inputs
+        norm_density = density / density.sum()
+
+        def objective(effective_sample_count: int) -> int:
+            return np.round(effective_sample_count * norm_density).sum() - num_samples
+
+        effective_sample_count = sp.optimize.bisect(objective, 0, 2 * num_samples)
+        counts = np.round(effective_sample_count * density / density.sum()).astype(int)
+
+    return np.repeat(density.rupture.values, counts)
 
 
 def bin_magnitudes(
@@ -734,76 +737,151 @@ def ground_motion_database(
     # gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", logic_tree)
 
 
+def draw_z_scores(z: xr.DataArray, n: int, rng: np.random.Generator) -> np.ndarray:
+    dist = sp.stats.truncnorm(STDDEV_LOWER, STDDEV_UPPER)
+    z_arr = z.values
+    dz = z_arr[1] - z_arr[0]
+    if not np.all(np.isclose(np.diff(z_arr), dz)):
+        raise ValueError("Z-score sampling assumes dz is constant")
+    start = z_arr - dz / 2
+    end = z_arr + dz / 2
+    weights = dist.cdf(end) - dist.cdf(start)
+    z_values = rng.choice(
+        z_arr,
+        size=n,
+        p=weights,
+        replace=True,
+    )
+    return z_values
+
+
+def draw_models(
+    logic_tree: xr.DataArray, n: int, rng: np.random.Generator
+) -> tuple[np.ndarray, tuple]:
+    logic_tree_df = logic_tree.to_dataframe().reset_index()
+
+    sample = logic_tree_df.sample(n, replace=True, random_state=rng, weights="weights")
+
+    return sample["gmm"].values, sample["epistemic_branch"].values
+
+
+def create_sample_array(
+    ruptures: np.ndarray, z: np.ndarray, models: np.ndarray, branches: np.ndarray
+) -> xr.Dataset:
+    return xr.Dataset(
+        dict(
+            rupture=("sample", ruptures),
+            z=("sample", z),
+            model=("sample", models),
+            branch=("sample", branches),
+        ),
+        coords=dict(sample=np.arange(len(z))),
+    )
+
+
+def sample_ground_motions(sample_array: xr.Dataset, gmm_database: xr.Dataset):
+    ground_motion_stats = gmm_database.sel(
+        rupture=sample_array["rupture"],
+        z=sample_array["z"],
+        gmm=sample_array["model"],
+        site=sample_array["site"],
+    )
+
+    mean = ground_motion_stats["log_mean"]
+    stddev = ground_motion_stats["log_stddev"]
+    return mean + stddev * (sample_array["branch"] + sample_array["epsilon"])
+
+
+def draw_random_variate(
+    like: np.ndarray, correlation: np.ndarray, rng: np.random.Generator
+) -> np.ndarray:
+    z = rng.normal(size=like.shape)
+    l = np.linalg.cholesky(correlation)
+    return (l @ z[..., np.newaxis]).squeeze()
+
+
+def period_correlation_matrix(periods: np.ndarray) -> np.ndarray:
+    model = BakerJayaram2008()
+    return model.get_cross_correlation_mtx([SA(p) for p in periods])
+
+
+def draw_sample_inputs(
+    n: int,
+    rupture_density: xr.DataArray,
+    logic_tree: xr.DataArray,
+    gmm_database: xr.Dataset,
+    rng: np.random.Generator,
+) -> xr.Dataset:
+    sample_ruptures = draw_ruptures(
+        rupture_density,
+        n,
+        rng=rng,
+        random=False,
+    )
+    sample_z_scores = draw_z_scores(gmm_database["z"], n, rng=rng)
+    logic_tree = logic_tree_with_weights()
+    sample_models, sample_branches = draw_models(logic_tree, n, rng=rng)
+    sample_array = create_sample_array(
+        sample_ruptures, sample_z_scores, sample_models, sample_branches
+    )
+    # Introduce sites and periods as additional parameters
+    sample_array, _, _ = xr.broadcast(
+        sample_array, gmm_database["site"], gmm_database["period"]
+    )
+    correlation = period_correlation_matrix(gmm_database["period"].values)
+    dimensions = ["sample", "site", "period"]
+    sample_variate = xr.apply_ufunc(
+        draw_random_variate,
+        sample_array["z"],
+        input_core_dims=[dimensions],
+        output_core_dims=[dimensions],
+        kwargs=dict(rng=rng, correlation=correlation),
+    )
+
+    sample_array["epsilon"] = sample_variate
+    return sample_array
+
+
 @app.command()
 def monte_carlo_hazard(
-    ruptures_path: Path,
-    source_to_site_path: Path,
-    sites_path: Path,
-    distributed_seismicity_path: Path,
+    ruptures: Path,
+    ground_motion_database: Path,
     n: int,
     gmm_hazard_path: Path,
-    num_realisations: int = 10,
-    periods: list[float] | None = None,
     thresholds: list[float] | None = None,
+    num_realisations: int = 10,
     seed: int = 0,
     column: str = "kl_density",
-    logic_tree: bool = False,
 ) -> None:
-    client = Client()
-    print(f"Dashboard at {client.dashboard_link}")
-    ruptures, source_to_site, sites = load_hazard_inputs(
-        ruptures_path, source_to_site_path, sites_path
-    )
-    periods_arr = np.array(periods or DEFAULT_PERIODS)
-    thresholds_arr = np.asarray(thresholds) if thresholds else THRESHOLDS
-    seed_sequence = np.random.SeedSequence(seed)
-    seeds = seed_sequence.spawn(3)
-    sample_counts = draw_rupture_sample_counts(
-        ruptures[column],
-        n,
-        num_realisations,
-        random=False,
-        rng=np.random.default_rng(seeds[0]),
-    )
-    gmm_inputs = ground_motion_inputs(ruptures, source_to_site, sites)
-    # Broadcast to all periods
+    with Client():
+        ruptures = gpd.read_parquet(ruptures).rename_axis("rupture")
+        gmm_database = xr.open_dataset(ground_motion_database)
+        thresholds_arr = np.asarray(thresholds) if thresholds else THRESHOLDS
+        thresholds_da = np.log(singleton_array(thresholds_arr, "threshold"))
 
-    breakpoint()
+        # Collect ensemble results
+        all_hazard_results = []
+        logic_tree = logic_tree_with_weights()
+        # Range is from seed to seed + num_realisations to ensure independence
+        rng = np.random.default_rng(seed)
+        for i in tqdm.trange(num_realisations, unit="realisation"):
+            sample_array = draw_sample_inputs(
+                n, ruptures[column].to_xarray(), logic_tree, gmm_database, rng=rng
+            )
+            sample_array = sample_array.chunk(dict(sample=50, site=50, period=-1))
+            samples = sample_ground_motions(sample_array, gmm_database)
+            rate = ruptures["rate"].to_xarray()
+            hazard = (rate * (samples > thresholds_da).mean("sample")).sum("rupture")
 
-    # Collect ensemble results
-    all_hazard_results = []
+            all_hazard_results.append(hazard)
 
-    # Range is from seed to seed + num_realisations to ensure independence
-    pbar_outer = tqdm.trange(num_realisations, desc="Realisations", position=0)
-    for i in pbar_outer:
-        current_seed = (seed + i) if seed is not None else None
-        pbar_outer.set_description(
-            f"Realisation {i + 1}/{num_realisations} (Seed: {current_seed})"
+        rupture_hazard_ensemble = xr.concat(
+            all_hazard_results,
+            dim=pd.Index(range(num_realisations), name="realisation"),
         )
-        run_hazard = calculate_monte_carlo_hazard(
-            ruptures,
-            source_to_site,
-            sites,
-            periods_arr,
-            thresholds_arr,
-            n,
-            column,
-            current_seed,
-            logic_tree=logic_tree,
-        )
-        all_hazard_results.append(run_hazard)
+        rupture_hazard_ensemble.attrs["seed"] = seed
 
-    rupture_hazard_ensemble = xr.concat(
-        all_hazard_results, dim=pd.Index(range(num_realisations), name="realisation")
-    )
-
-    ds_hazard = compute_distributed_hazard(
-        distributed_seismicity_path, sites, rupture_hazard_ensemble.threshold.values
-    )
-
-    xr.Dataset(dict(ds_hazard=ds_hazard, hazard=rupture_hazard_ensemble)).to_netcdf(
-        gmm_hazard_path, engine="h5netcdf"
-    )
+        rupture_hazard_ensemble.to_zarr(gmm_hazard_path, mode="w")
 
 
 if __name__ == "__main__":
