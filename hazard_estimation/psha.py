@@ -506,36 +506,6 @@ def compute_distributed_hazard(
     return ds_hazard.interp(threshold=target_thresholds)
 
 
-@app.command()
-def hazard(
-    ruptures_path: Path,
-    source_to_site_path: Path,
-    sites_path: Path,
-    distributed_seismicity_path: Path,
-    n: int,
-    gmm_hazard_path: Path,
-    periods: list[float] | None = None,
-    thresholds: list[float] | None = None,
-    logic_tree: bool = False,
-) -> None:
-    ruptures, source_to_site, sites = load_hazard_inputs(
-        ruptures_path, source_to_site_path, sites_path
-    )
-    periods_arr = np.array(periods or DEFAULT_PERIODS)
-    thresholds_arr = np.asarray(thresholds) if thresholds else THRESHOLDS
-
-    rupture_hazard = calculate_analytical_hazard(
-        ruptures, source_to_site, sites, periods_arr, thresholds_arr, n, logic_tree
-    )
-
-    ds_hazard = compute_distributed_hazard(
-        distributed_seismicity_path, sites, rupture_hazard.threshold.values
-    )
-    xr.Dataset(dict(ds_hazard=ds_hazard, hazard=rupture_hazard)).to_netcdf(
-        gmm_hazard_path, engine="h5netcdf"
-    )
-
-
 def draw_ruptures(
     density: xr.DataArray,
     num_samples: int,
@@ -675,20 +645,24 @@ def ground_motion_database(
     # gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", logic_tree)
 
 
-def draw_z_scores(z: xr.DataArray, n: int, rng: np.random.Generator) -> np.ndarray:
+def z_weights(z: xr.DataArray) -> xr.DataArray:
     dist = sp.stats.truncnorm(STDDEV_LOWER, STDDEV_UPPER)
-    z_arr = z.values
-    dz = z_arr[1] - z_arr[0]
-    if not np.all(np.isclose(np.diff(z_arr), dz)):
+    dz = z[1] - z[0]
+    if not np.allclose(np.diff(z), dz):
         raise ValueError("Z-score sampling assumes dz is constant")
-    start = z_arr - dz / 2
-    end = z_arr + dz / 2
+    start = z - dz / 2
+    end = z + dz / 2
     weights = (dist.cdf(end) - dist.cdf(start)).astype(np.float32)
+    return weights
 
+
+def draw_z_scores(z: xr.DataArray, n: int, rng: np.random.Generator) -> np.ndarray:
+    z_arr = z.values
+    weights_arr = z_weights(z_arr)
     z_values = rng.choice(
         z_arr,
         size=n,
-        p=weights,
+        p=weights_arr,
         replace=True,
     )
     return z_values.astype(np.float32)
@@ -833,6 +807,54 @@ def monte_carlo_hazard(
     rupture_hazard_ensemble.attrs["seed"] = seed
 
     rupture_hazard_ensemble.to_zarr(gmm_hazard_path, mode="w")
+
+
+def survival_function(mu, model_branch, sigma, threshold):
+    z = (threshold - (mu + model_branch)) / (sigma * np.sqrt(2))
+    return xr.apply_ufunc(sp.special.erfc, z, dask="allowed")
+
+
+@app.command()
+def analytical_hazard(
+    ruptures_path: Path,
+    ground_motion_database: Path,
+    gmm_hazard_path: Path,
+) -> None:
+    ruptures = gpd.read_parquet(ruptures_path).rename_axis("rupture")
+    rates = ruptures["rate"].to_xarray()
+    model_weights = logic_tree_with_weights()
+    thresholds_arr = THRESHOLDS
+    thresholds_da = np.log(singleton_array(thresholds_arr, "threshold")).astype(
+        np.float32
+    )
+
+    with (
+        xr.open_dataset(ground_motion_database, mode="r") as gmm_database,
+        LocalCluster(host="0.0.0.0") as cluster,
+        Client(cluster) as client,
+    ):
+        print(f"Dashboard at {client.dashboard_link}")
+        gmm_database = normalise_dtypes(gmm_database)
+        gmm_database = gmm_database.chunk(
+            dict(period=-1, gmm=-1, rupture=30, site=30, z=-1)
+        )
+        sf = survival_function(
+            gmm_database["log_mean"],
+            model_weights["epistemic_branch"].chunk(dict(epistemic_branch=-1)),
+            gmm_database["log_stddev"],
+            thresholds_da.chunk(dict(threshold=-1)),
+        )
+        z_weights_da = xr.DataArray(
+            z_weights(sf["z"]), dims=["z"], coords=dict(z=sf["z"])
+        )
+        sf = sf * z_weights_da
+        # Integrate out z using trapezium rule for greater accuracy
+        sf = sf.integrate("z")
+        # Then sum out the epistemic branches and models by weights
+        sf = (model_weights * sf).sum(["epistemic_branch", "gmm"])
+        # Finally, convert the poe to hazard rates
+        hazard = rates * sf
+        hazard.to_zarr(gmm_hazard_path, mode="w")
 
 
 if __name__ == "__main__":
