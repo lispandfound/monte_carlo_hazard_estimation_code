@@ -4,6 +4,7 @@ import parse
 
 from distributed import Client, LocalCluster
 
+import bisect
 import numpy.typing as npt
 import psutil
 import functools
@@ -511,19 +512,23 @@ def draw_ruptures(
     num_samples: int,
     random: bool,
     rng: np.random.Generator,
-) -> np.ndarray:
+) -> tuple[int, np.ndarray]:
     if random:
-        counts = rng.multinomial(num_samples, density)
+        counts = rng.multinomial(num_samples, density.values)
+        effective_sample_count = num_samples
     else:
         norm_density = density / density.sum()
 
-        def objective(effective_sample_count: int) -> int:
-            return np.round(effective_sample_count * norm_density).sum() - num_samples
+        def get_sum(effective_count: int) -> float:
+            return np.round(effective_count * norm_density).sum()
 
-        effective_sample_count = sp.optimize.bisect(objective, 0, 2 * num_samples)
+        effective_sample_count = bisect.bisect_right(
+            np.arange(100000), num_samples, key=get_sum
+        )
+
         counts = np.round(effective_sample_count * norm_density).astype(int)
 
-    return np.repeat(density.rupture.values, counts)
+    return int(counts.sum().item()), np.repeat(density.rupture.values, counts)
 
 
 def bin_magnitudes(
@@ -726,13 +731,15 @@ def draw_sample_inputs(
     logic_tree: xr.DataArray,
     gmm_database: xr.Dataset,
     rng: np.random.Generator,
-) -> xr.Dataset:
-    sample_ruptures = draw_ruptures(
+) -> tuple[int, xr.Dataset]:
+    effective_sample_counts, sample_ruptures = draw_ruptures(
         rupture_density,
         n,
         rng=rng,
         random=False,
     )
+    # Reset sample ruptures to be an effective sample count instead of the actual sample count
+    n = effective_sample_counts
     sample_z_scores = draw_z_scores(gmm_database["z"], n, rng=rng)
     logic_tree = logic_tree_with_weights()
     sample_models, sample_branches = draw_models(logic_tree, n, rng=rng)
@@ -754,7 +761,7 @@ def draw_sample_inputs(
     )
 
     sample_array["epsilon"] = sample_variate
-    return sample_array
+    return n, sample_array
 
 
 def normalise_dtypes(dset: xr.Dataset) -> xr.Dataset:
@@ -787,7 +794,7 @@ def monte_carlo_hazard(
         rng = np.random.default_rng(seed)
         pbar = tqdm.trange(num_realisations, unit="realisation")
         for i in pbar:
-            sample_array = draw_sample_inputs(
+            effective_n, sample_array = draw_sample_inputs(
                 n, ruptures[column].to_xarray(), logic_tree, gmm_database, rng=rng
             )
             samples = sample_ground_motions(sample_array, gmm_database)
@@ -795,6 +802,8 @@ def monte_carlo_hazard(
             rate = ruptures["rate"].to_xarray()
             poe = (samples > thresholds_da).mean("sample")
             hazard = (rate * poe).sum("rupture")
+            hazard.attrs["effective_n"] = effective_n
+            hazard.attrs["n"] = n
             all_hazard_results.append(hazard.compute())
             mem = psutil.Process().memory_info().rss
             mem_gb = mem / 1e09
