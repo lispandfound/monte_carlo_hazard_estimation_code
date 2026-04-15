@@ -5,6 +5,7 @@ import parse
 from distributed import Client, LocalCluster
 
 import numpy.typing as npt
+import psutil
 import functools
 import math
 from pathlib import Path
@@ -352,47 +353,6 @@ def _fast_threshold_mask(mu, sigma, thresholds, out):
             out[t] = 0
 
 
-def _calculate_threshold_exceedance(mu, sigma, thresholds):
-    rng = np.random.default_rng()
-
-    realisation = rng.normal(mu, sigma)
-    return realisation[..., np.newaxis] > thresholds
-
-
-def monte_carlo_threshold_occupancy(
-    ground_motion_observations: xr.Dataset,
-    thresholds: Array1,
-) -> xr.DataArray:
-    thresholds_da = xr.DataArray(
-        np.log(thresholds), dims=["threshold"], coords={"threshold": thresholds}
-    )
-    counts = xr.apply_ufunc(
-        _calculate_threshold_exceedance,
-        ground_motion_observations.log_mean,
-        ground_motion_observations.log_stddev,
-        thresholds_da,
-        input_core_dims=[[], [], ["threshold"]],
-        output_core_dims=[["threshold"]],
-        output_dtypes=[np.int8],
-        dask="parallelized",
-        dask_gufunc_kwargs={"output_sizes": {"threshold": len(thresholds)}},
-    )
-    expected_sites = ground_motion_observations.site.values
-    expected_ruptures = np.unique(ground_motion_observations.rupture.values)
-    poe = flox.xarray.xarray_reduce(
-        counts,
-        "site",
-        "rupture",
-        func="mean",
-        expected_groups=(
-            expected_sites,
-            expected_ruptures,
-        ),
-    )
-
-    return poe
-
-
 @numba.guvectorize(
     ["(float64, float64, float64, float64[:])"],
     "(),(),()->()",
@@ -577,27 +537,6 @@ def hazard(
     )
 
 
-# def calculate_monte_carlo_hazard(
-#     counts: xr.DataArray,
-#     gmm_outputs: xr.Dataset,
-#     seed: int | None,
-#     logic_tree: bool = False,
-# ) -> xr.DataArray:
-#     """End-to-end Python API for monte carlo hazard."""
-
-
-#         pbar.set_description(f"pSA({period:.2f})")
-#         gmm_outputs = run_ground_motion_model(gmm_inputs, "pSA", period, logic_tree)
-#         hazard = aggregate_monte_carlo_hazard(
-#             gmm_outputs,
-#             ruptures["rate"].to_xarray(),
-#             thresholds,
-#         )
-#         hazards.append(hazard.sum("rupture"))
-
-#     return xr.concat(hazards, dim=pd.Index(periods, name="period"))
-
-
 def draw_ruptures(
     density: xr.DataArray,
     num_samples: int,
@@ -745,24 +684,25 @@ def draw_z_scores(z: xr.DataArray, n: int, rng: np.random.Generator) -> np.ndarr
         raise ValueError("Z-score sampling assumes dz is constant")
     start = z_arr - dz / 2
     end = z_arr + dz / 2
-    weights = dist.cdf(end) - dist.cdf(start)
+    weights = (dist.cdf(end) - dist.cdf(start)).astype(np.float32)
+
     z_values = rng.choice(
         z_arr,
         size=n,
         p=weights,
         replace=True,
     )
-    return z_values
+    return z_values.astype(np.float32)
 
 
 def draw_models(
     logic_tree: xr.DataArray, n: int, rng: np.random.Generator
-) -> tuple[np.ndarray, tuple]:
+) -> tuple[np.ndarray, np.ndarray]:
     logic_tree_df = logic_tree.to_dataframe().reset_index()
 
     sample = logic_tree_df.sample(n, replace=True, random_state=rng, weights="weights")
 
-    return sample["gmm"].values, sample["epistemic_branch"].values
+    return sample["gmm"].values, sample["epistemic_branch"].values.astype(np.float32)
 
 
 def create_sample_array(
@@ -780,16 +720,19 @@ def create_sample_array(
 
 
 def sample_ground_motions(sample_array: xr.Dataset, gmm_database: xr.Dataset):
-    ground_motion_stats = gmm_database.sel(
+    selection = dict(
         rupture=sample_array["rupture"],
         z=sample_array["z"],
         gmm=sample_array["model"],
         site=sample_array["site"],
     )
+    ground_motions = sample_array["branch"].copy()
+    breakpoint()
+    ground_motions += sample_array["epsilon"]
+    ground_motions *= gmm_database["log_stddev"].sel(selection)
+    ground_motions += gmm_database["log_mean"].sel(selection)
 
-    mean = ground_motion_stats["log_mean"]
-    stddev = ground_motion_stats["log_stddev"]
-    return mean + stddev * (sample_array["branch"] + sample_array["epsilon"])
+    return ground_motions
 
 
 def draw_random_variate(
@@ -797,7 +740,7 @@ def draw_random_variate(
 ) -> np.ndarray:
     z = rng.normal(size=like.shape)
     l = np.linalg.cholesky(correlation)
-    return (l @ z[..., np.newaxis]).squeeze()
+    return (l @ z[..., np.newaxis]).squeeze().astype(np.float32)
 
 
 def period_correlation_matrix(periods: np.ndarray) -> np.ndarray:
@@ -842,6 +785,13 @@ def draw_sample_inputs(
     return sample_array
 
 
+def normalise_dtypes(dset: xr.Dataset) -> xr.Dataset:
+    # normalise dtypes so that indexing is possible with 32-bit floats
+    dset["z"] = dset["z"].astype(np.float32)
+    dset["period"] = dset["period"].astype(np.float32)
+    return dset
+
+
 @app.command()
 def monte_carlo_hazard(
     ruptures: Path,
@@ -853,25 +803,30 @@ def monte_carlo_hazard(
     column: str = "kl_density",
 ) -> None:
     ruptures = gpd.read_parquet(ruptures).rename_axis("rupture")
-    gmm_database = xr.open_dataset(ground_motion_database)
-    thresholds_arr = THRESHOLDS
-    thresholds_da = np.log(singleton_array(thresholds_arr, "threshold"))
+    with xr.open_dataset(ground_motion_database, mode="r") as gmm_database:
+        gmm_database = normalise_dtypes(gmm_database)
+        thresholds_arr = THRESHOLDS
+        thresholds_da = np.log(singleton_array(thresholds_arr, "threshold"))
 
-    # Collect ensemble results
-    all_hazard_results = []
-    logic_tree = logic_tree_with_weights()
-    # Range is from seed to seed + num_realisations to ensure independence
-    rng = np.random.default_rng(seed)
-    for i in tqdm.trange(num_realisations, unit="realisation"):
-        sample_array = draw_sample_inputs(
-            n, ruptures[column].to_xarray(), logic_tree, gmm_database, rng=rng
-        )
-        sample_array = sample_array.chunk(dict(sample=50, site=50, period=-1))
-        samples = sample_ground_motions(sample_array, gmm_database)
-        rate = ruptures["rate"].to_xarray()
-        hazard = (rate * (samples > thresholds_da).mean("sample")).sum("rupture")
+        # Collect ensemble results
+        all_hazard_results = []
+        logic_tree = logic_tree_with_weights()
+        # Range is from seed to seed + num_realisations to ensure independence
+        rng = np.random.default_rng(seed)
+        pbar = tqdm.trange(num_realisations, unit="realisation")
+        for i in pbar:
+            sample_array = draw_sample_inputs(
+                n, ruptures[column].to_xarray(), logic_tree, gmm_database, rng=rng
+            )
+            samples = sample_ground_motions(sample_array, gmm_database)
 
-        all_hazard_results.append(hazard)
+            rate = ruptures["rate"].to_xarray()
+            poe = (samples > thresholds_da).mean("sample")
+            hazard = (rate * poe).sum("rupture")
+            all_hazard_results.append(hazard.compute())
+            mem = psutil.Process().memory_info().rss
+            mem_gb = mem / 1e09
+            pbar.set_description(f"Memory usage ({mem_gb:.2f} GB)")
 
     rupture_hazard_ensemble = xr.concat(
         all_hazard_results,
