@@ -521,7 +521,7 @@ def draw_ruptures(
             return np.round(effective_sample_count * norm_density).sum() - num_samples
 
         effective_sample_count = sp.optimize.bisect(objective, 0, 2 * num_samples)
-        counts = np.round(effective_sample_count * density / density.sum()).astype(int)
+        counts = np.round(effective_sample_count * norm_density).astype(int)
 
     return np.repeat(density.rupture.values, counts)
 
