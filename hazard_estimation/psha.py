@@ -819,8 +819,18 @@ def monte_carlo_hazard(
 
 
 def survival_function(mu, model_branch, sigma, threshold):
-    z = (threshold - (mu + model_branch)) / (sigma * np.sqrt(2))
-    return xr.apply_ufunc(sp.special.erfc, z, dask="allowed")
+    # Standard normal transform is
+    # z = (x - mu) / sigma
+    # The scipy.special.ndtr function is the standard normal cdf.
+    # Using 1 - ndtr(z) = ndtr(-z) we distribute the - into the equation to limit the number of operations:
+    # z = -(x - mu) / sigma
+    #   = ((-x) + mu) / sigma
+    # This is more accurate than using erfc for the same calculation.
+
+    # Model branch is the epistemic branch of the calculation and is basically a
+    # shift to the mean of the distribution, but with the same scale.
+    z = ((-threshold) + (mu + model_branch)) / sigma
+    return xr.apply_ufunc(sp.special.ndtr, z, dask="allowed")
 
 
 @app.command()
