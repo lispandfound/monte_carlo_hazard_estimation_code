@@ -13,7 +13,6 @@ from pathlib import Path
 from dask.diagnostics import ProgressBar
 import dask.array as da
 import cyclopts
-import flox.xarray
 import geopandas as gpd
 import numba
 import numpy as np
@@ -727,7 +726,6 @@ def sample_ground_motions(sample_array: xr.Dataset, gmm_database: xr.Dataset):
         site=sample_array["site"],
     )
     ground_motions = sample_array["branch"].copy()
-    breakpoint()
     ground_motions += sample_array["epsilon"]
     ground_motions *= gmm_database["log_stddev"].sel(selection)
     ground_motions += gmm_database["log_mean"].sel(selection)
