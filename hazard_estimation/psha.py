@@ -869,11 +869,8 @@ def analytical_hazard(
         z_weights_da = xr.DataArray(
             z_weights(sf["z"]), dims=["z"], coords=dict(z=sf["z"])
         )
-        sf = sf * z_weights_da
-        # Integrate out z using trapezium rule for greater accuracy
-        sf = sf.integrate("z")
-        # Then sum out the epistemic branches and models by weights
-        sf = (model_weights * sf).sum(["epistemic_branch", "gmm"])
+        # Then sum out the epistemic branches, z values and models by weights
+        sf = (model_weights * sf * z_weights_da).sum(["z", "epistemic_branch", "gmm"])
         # Finally, convert the poe to hazard rates
         hazard = rates * sf
         hazard.to_zarr(gmm_hazard_path, mode="w")
