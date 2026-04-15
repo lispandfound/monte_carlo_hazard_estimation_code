@@ -819,6 +819,7 @@ def analytical_hazard(
     ruptures_path: Path,
     ground_motion_database: Path,
     gmm_hazard_path: Path,
+    model: str | None = None,
 ) -> None:
     ruptures = gpd.read_parquet(ruptures_path).rename_axis("rupture")
     rates = ruptures["rate"].to_xarray()
@@ -827,7 +828,6 @@ def analytical_hazard(
     thresholds_da = np.log(singleton_array(thresholds_arr, "threshold")).astype(
         np.float32
     )
-
     with (
         xr.open_dataset(ground_motion_database, mode="r") as gmm_database,
         LocalCluster(host="0.0.0.0") as cluster,
@@ -838,6 +838,9 @@ def analytical_hazard(
         gmm_database = gmm_database.chunk(
             dict(period=-1, gmm=-1, rupture=30, site=30, z=-1)
         )
+        if model:
+            model = oqw.constants.GMM(model)
+            gmm_database = gmm_database.sel(gmm=model)
         sf = survival_function(
             gmm_database["log_mean"],
             model_weights["epistemic_branch"].chunk(dict(epistemic_branch=-1)),
