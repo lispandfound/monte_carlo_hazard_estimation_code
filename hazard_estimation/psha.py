@@ -797,14 +797,15 @@ def monte_carlo_hazard(
             effective_n, sample_array = draw_sample_inputs(
                 n, ruptures[column].to_xarray(), logic_tree, gmm_database, rng=rng
             )
+
             sampled_ruptures = np.unique(sample_array["rupture"])
             samples = sample_ground_motions(sample_array, gmm_database)
-
+            samples = samples.chunk(dict(sample=100, site=100, period=-1))
             rate = ruptures["rate"].to_xarray()
 
             # Take the mean in the sample dimension, grouping by the rupture dimension.
             poe = flox.xarray.xarray_reduce(
-                samples > thresholds_da,
+                samples > thresholds_da.chunk(threshold=1),
                 "rupture",
                 expected_groups=sampled_ruptures,
                 dim="sample",
