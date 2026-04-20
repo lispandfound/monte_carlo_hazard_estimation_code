@@ -23,6 +23,7 @@ import scipy as sp
 import shapely
 import tqdm
 import xarray as xr
+import flox.xarray
 from openquake.hazardlib.cross_correlation import BakerJayaram2008
 from openquake.hazardlib.imt import SA
 
@@ -600,7 +601,6 @@ def ground_motion_database(
     sites_path: Path,
     output: Path,
     periods: list[float] | None = None,
-    logic_tree: bool = False,
     rupture_chunk: int = 50,
     site_chunk: int = 50,
     z_chunk: int = -1,
@@ -797,10 +797,20 @@ def monte_carlo_hazard(
             effective_n, sample_array = draw_sample_inputs(
                 n, ruptures[column].to_xarray(), logic_tree, gmm_database, rng=rng
             )
+            sampled_ruptures = np.unique(sample_array["rupture"])
             samples = sample_ground_motions(sample_array, gmm_database)
 
             rate = ruptures["rate"].to_xarray()
-            poe = (samples > thresholds_da).mean("sample")
+
+            # Take the mean in the sample dimension, grouping by the rupture dimension.
+            poe = flox.xarray.xarray_reduce(
+                samples > thresholds_da,
+                "rupture",
+                expected_groups=sampled_ruptures,
+                dim="sample",
+                func="mean",
+            )
+
             hazard = (rate * poe).sum("rupture")
             hazard.attrs["effective_n"] = effective_n
             hazard.attrs["n"] = n
@@ -838,7 +848,7 @@ def analytical_hazard(
     ruptures_path: Path,
     ground_motion_database: Path,
     gmm_hazard_path: Path,
-    model: str | None = None,
+    model: oqw.constants.GMM | None = None,
 ) -> None:
     ruptures = gpd.read_parquet(ruptures_path).rename_axis("rupture")
     rates = ruptures["rate"].to_xarray()
@@ -858,7 +868,6 @@ def analytical_hazard(
             dict(period=-1, gmm=-1, rupture=30, site=30, z=-1)
         )
         if model:
-            model = oqw.constants.GMM(model)
             gmm_database = gmm_database.sel(gmm=model)
         sf = survival_function(
             gmm_database["log_mean"],
