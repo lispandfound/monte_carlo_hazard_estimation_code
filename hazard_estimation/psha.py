@@ -771,6 +771,79 @@ def normalise_dtypes(dset: xr.Dataset) -> xr.Dataset:
     return dset
 
 
+@numba.njit(parallel=True, cache=True, fastmath=True)
+def _hazard_kernel(
+    samples: np.ndarray,
+    rup_idx: np.ndarray,
+    log_thresholds: np.ndarray,
+    rupture_rates: np.ndarray,
+) -> np.ndarray:
+    n_sample, n_site, n_period = samples.shape
+    n_thresh = log_thresholds.shape[0]
+    n_ruptures = rupture_rates.shape[0]
+
+    hazard = np.zeros((n_site, n_period, n_thresh), dtype=np.float64)
+
+    for s in numba.prange(n_site):
+        local_counts = np.zeros(n_ruptures, dtype=np.int32)
+        local_exc = np.zeros((n_ruptures, n_thresh), dtype=np.float32)
+
+        for p in range(n_period):
+            for r in range(n_ruptures):
+                local_counts[r] = 0
+                for t in range(n_thresh):
+                    local_exc[r, t] = np.float32(0.0)
+
+            for i in range(n_sample):
+                r = rup_idx[i, s, p]
+                val = samples[i, s, p]
+                local_counts[r] += 1
+                for t in range(n_thresh):
+                    if val > log_thresholds[t]:
+                        local_exc[r, t] += np.float32(1.0)
+
+            for r in range(n_ruptures):
+                c = local_counts[r]
+                if c > 0:
+                    rate_over_c = rupture_rates[r] / np.float64(c)
+                    for t in range(n_thresh):
+                        hazard[s, p, t] += rate_over_c * np.float64(local_exc[r, t])
+
+    return hazard
+
+
+def compute_hazard(
+    samples: xr.DataArray,
+    log_thresholds: np.ndarray,
+    unique_ruptures: np.ndarray,
+    rate: xr.DataArray,
+) -> xr.DataArray:
+    max_id = int(unique_ruptures.max())
+    lookup = np.full(max_id + 1, -1, dtype=np.int32)
+    lookup[unique_ruptures] = np.arange(len(unique_ruptures), dtype=np.int32)
+
+    rup_idx = lookup[samples.coords["rupture"].values.astype(np.int64)]
+
+    rupture_rates = rate.sel(rupture=unique_ruptures).values.astype(np.float64)
+
+    hazard_np = _hazard_kernel(
+        np.ascontiguousarray(samples.values, dtype=np.float32),
+        np.ascontiguousarray(rup_idx, dtype=np.int32),
+        np.ascontiguousarray(log_thresholds, dtype=np.float32),
+        rupture_rates,
+    )
+
+    return xr.DataArray(
+        hazard_np,
+        dims=["site", "period", "threshold"],
+        coords={
+            "site": samples.coords["site"],
+            "period": samples.coords["period"],
+            "threshold": np.exp(log_thresholds),
+        },
+    )
+
+
 @app.command()
 def monte_carlo_hazard(
     ruptures: Path,
@@ -782,7 +855,7 @@ def monte_carlo_hazard(
     column: str = "kl_density",
 ) -> None:
     ruptures = gpd.read_parquet(ruptures).rename_axis("rupture")
-    with xr.open_dataset(ground_motion_database, mode="r") as gmm_database:
+    with xr.open_dataset(ground_motion_database, mode="r") as gmm_database, Client():
         gmm_database = normalise_dtypes(gmm_database)
         thresholds_arr = THRESHOLDS
         thresholds_da = np.log(singleton_array(thresholds_arr, "threshold"))
@@ -800,22 +873,15 @@ def monte_carlo_hazard(
 
             sampled_ruptures = np.unique(sample_array["rupture"])
             samples = sample_ground_motions(sample_array, gmm_database)
-            samples = samples.chunk(dict(sample=100, site=100, period=-1))
             rate = ruptures["rate"].to_xarray()
 
             # Take the mean in the sample dimension, grouping by the rupture dimension.
-            poe = flox.xarray.xarray_reduce(
-                samples > thresholds_da.chunk(threshold=1),
-                "rupture",
-                expected_groups=sampled_ruptures,
-                dim="sample",
-                func="mean",
+            hazard = compute_hazard(
+                samples, thresholds_da.values, sampled_ruptures, rate
             )
-
-            hazard = (rate * poe).sum("rupture")
             hazard.attrs["effective_n"] = effective_n
             hazard.attrs["n"] = n
-            all_hazard_results.append(hazard.compute())
+            all_hazard_results.append(hazard)
             mem = psutil.Process().memory_info().rss
             mem_gb = mem / 1e09
             pbar.set_description(f"Memory usage ({mem_gb:.2f} GB)")
